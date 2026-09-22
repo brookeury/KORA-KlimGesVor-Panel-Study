@@ -1,0 +1,1588 @@
+
+This file contains code to explore general trends between temperature and lung function health outcomes, including DLNM models, GEEs, and GAMs.
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(dlnm)
+library(lme4)
+library(splines)
+library(mgcv)
+library(ggplot2)
+library(patchwork)
+library(geepack)
+library(corrplot)
+```
+
+get datasets
+```{r}
+outdir <- ""
+
+envraw <- read.csv(file.path(outdir, "exposure data", "LFU_Rest_Augsburg_2022_25.csv"))
+imp_env <- readRDS(file.path(outdir, "env_imputed.rds"))
+df <- readRDS(file.path(outdir, "clean_df_w_env_imp.rds"))
+
+```
+
+
+setting up variables
+```{r}
+# Covariates (month is already included as a fixed effect or spline term)
+cov_fixed <- c("v2it_sex", "v2it_age", "v2i_panel", "v2it_smoking", "v2ht_respinfection")
+cov_fixed <- c("v2ht_respinfection")
+id_var <- "ID"
+
+outcomes <- list(
+  FEV1FVC = list(
+    var   = "v2h_FEV1FVC",
+    title = "FEV1/FVC (%)"
+  ),
+  FEV1 = list(
+    var   = "v2h_FEV1_mL",
+    title = "FEV1 (mL)"
+  ),
+  FVC = list(
+    var   = "v2h_FVC_mL",
+    title = "FVC (mL)"
+  )
+)
+```
+
+labels
+```{r}
+nice_env_labels <- function(var) {
+  labels <- c(
+    "env_temp_daily_mean" = "Temperature Daily Avg",
+    "env_temp_daily_sd"  = "Temperature SD",
+    "env_temp_daily_min" = "Temperature Min",
+    "env_temp_daily_max" = "Temperature Max",
+    "env_PM25_daily_mean" = "PM2.5 Daily Avg",
+    "log_env_PM25_daily_mean" = "log PM2.5 Daily Avg",
+    "env_PM10_daily_mean" = "PM10 Daily Avg",
+    "log_env_PM10_daily_mean" = "log PM10 Daily Avg",
+    "env_bc_880_daily_mean" = "BC 880 Daily Avg",
+    "log_env_bc_880_daily_mean" = "log BC 880 Daily Avg",
+    "env_rel_humidity_daily_mean" = "Reltative Humidity Daily Avg",
+    "env_abs_humidity_daily_mean" = "Absolute Humidity Daily Avg",
+    "env_precip_daily_mean" = "Precipitation Daily Avg",
+    "log_env_precip_daily_mean" = "log Precipitation Daily Avg",
+    "env_temp_last3h" = "Temperature 3 hours prior",
+    "env_temp_last7h" = "Temperature 7 hours prior",
+    "env_temp_yesterday" = "Yesterday Temperature Avg",
+    "env_temp_last2d" = "2-Day Temperature Avg",
+    "env_temp_last3d" = "3-Day Temperature Avg",
+    "env_temp_last4d" = "4-Day Temperature Avg",
+    "env_temp_last5d" = "5-Day Temperature Avg",
+    "env_temp_last6d" = "6-Day Temperature Avg",
+    "env_temp_last7d" = "Weekly Temperature Avg",
+    "env_temp_last14d" = "2 Week Temperature Avg",
+    "temp_diff_yesterday" = "Today - Yesterday\nTemperature Average",
+    "temp_diff_weekly" = "Today - Weekly\nTemperature Average",
+    "env_temp_night_mean" = "Temperature Night Average"
+  )
+  
+  var <- as.character(var)
+  
+  out <- labels[var]
+  
+  out[is.na(out)] <- var[is.na(out)]
+  
+  return(out)
+}
+```
+
+creating additional variables
+```{r}
+#season
+df$season <- with(
+  df,
+  factor(
+    dplyr::case_when(
+      lubridate::month(v2h_examdate) %in% c(12, 1, 2) ~ "Winter",
+      lubridate::month(v2h_examdate) %in% c(3, 4, 5)  ~ "Spring",
+      lubridate::month(v2h_examdate) %in% c(6, 7, 8)  ~ "Summer",
+      lubridate::month(v2h_examdate) %in% c(9, 10, 11) ~ "Fall",
+      TRUE ~ NA_character_
+    ),
+    levels = c("Winter", "Spring", "Summer", "Fall")
+  )
+)
+
+df$month_num <- as.numeric(as.character(df$month))
+
+#hour of day
+
+df <- df %>%
+  mutate(
+    hourofday = lubridate::hour(v2ht_starttime),
+    dayofweek = lubridate::wday(v2ht_starttime, label = TRUE, abbr = FALSE),
+    weekofyear = lubridate::week(v2ht_starttime)
+  )
+
+```
+
+helper method so that plots are outputted in a helpful format
+```{r}
+paginate_exposure_plots <- function(
+    plot_list,
+    outcomes,
+    env_vars,
+    n_cols = 4   # env_vars per page (columns)
+) {
+  library(patchwork)
+  
+  n_out <- length(outcomes)
+  n_env <- length(env_vars)
+  
+  if (length(plot_list) != n_out * n_env) {
+    stop("plot_list length must equal outcomes × env_vars")
+  }
+  
+  # helper: index into your outcome-major list
+  get_plot <- function(out_j, env_i) {
+    (out_j - 1) * n_env + env_i
+  }
+  
+  # paginate env_vars
+  col_groups <- split(seq_len(n_env),
+                      ceiling(seq_len(n_env) / n_cols))
+  
+  for (i in seq_along(col_groups)) {
+    cols_idx <- col_groups[[i]]
+    
+    # build rows = outcomes
+    page_rows <- lapply(seq_len(n_out), function(out_j) {
+      
+      row_plots <- lapply(cols_idx, function(env_i) {
+        plot_list[[ get_plot(out_j, env_i) ]]
+      })
+      
+      wrap_plots(row_plots, ncol = length(cols_idx))
+    })
+    
+    # stack outcome rows vertically
+    page <- wrap_plots(page_rows, ncol = 1) +
+      plot_annotation(title = paste("Page", i))
+    
+    print(page)
+  }
+}
+```
+
+
+
+
+#1. visualizations of exposures
+
+variables
+```{r}
+env_vars <- c("env_temp_last3h","env_temp_daily_mean","env_temp_last7d","env_temp_daily_sd","env_temp_daily_min","env_temp_daily_max","env_abs_humidity_daily_mean","env_rel_humidity_daily_mean","env_PM25_daily_mean","env_PM10_daily_mean","env_bc_880_daily_mean","env_precip_daily_mean")
+```
+
+transformations (log, etc.)
+```{r}
+df <- df %>%
+  mutate(
+    log_env_bc_880_daily_mean   = log(env_bc_880_daily_mean + 1),
+    log_env_precip_daily_mean   = log(env_precip_daily_mean + 1),
+    log_env_PM25_daily_mean     = log(env_PM25_daily_mean + 1),
+    log_env_PM10_daily_mean     = log(env_PM10_daily_mean + 1),
+    
+    env_precip_daily_mean_p99 = ifelse(
+      env_precip_daily_mean <= quantile(env_precip_daily_mean, 0.99, na.rm = TRUE),
+      env_precip_daily_mean,
+      NA
+    )
+    
+  )
+
+#extra cols for visualizing
+env_vars <- c("log_env_PM25_daily_mean","log_env_PM10_daily_mean","log_env_bc_880_daily_mean","log_env_precip_daily_mean", "env_precip_daily_mean_p99","env_PM25_daily_mean","env_PM10_daily_mean","env_bc_880_daily_mean","env_precip_daily_mean","env_abs_humidity_daily_mean","env_rel_humidity_daily_mean")
+```
+
+look at histograms to investigate bins
+```{r}
+df %>% select(all_of(env_vars)) %>%
+  setNames(env_vars) %>%
+  pivot_longer(cols = everything(),
+               names_to = "variable",
+               values_to = "value") %>%
+  mutate(
+    variable = factor(variable, levels = env_vars)  
+  ) %>%
+  ggplot(aes(x = value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+  facet_wrap(
+    ~ variable,
+    scales = "free",
+    ncol = 4,
+    labeller = as_labeller(nice_env_labels) 
+  ) +
+  theme_classic(base_size = 8) +
+  theme(
+    strip.text = element_text(size = 8),
+    axis.text  = element_text(size = 6)
+  ) +
+  labs(
+    title = "Distribution of Environmental Variables",
+    x = NULL,
+    y = "Count"
+  )
+
+```
+
+get correlation matrix
+```{r}
+# subset and order variables
+df_corr <- df %>%
+  dplyr::select(all_of(env_vars))
+
+# compute correlation matrix
+cor_mat <- cor(df_corr, use = "pairwise.complete.obs")
+
+# apply nice labels
+colnames(cor_mat) <- nice_env_labels(colnames(cor_mat))
+rownames(cor_mat) <- nice_env_labels(rownames(cor_mat))
+
+corrplot(
+  cor_mat,
+  method = "color",
+  type = "upper",
+  tl.col = "black",
+  tl.cex = 0.7,
+  addCoef.col = "black",
+  number.cex = 0.5
+)
+```
+
+plot of temperature and precipitaiton by month
+```{r}
+envraw$date <- as.Date(envraw$date_neu, format = "%d-%B-%Y")
+
+env_sub <- subset(
+  envraw,
+  date >= as.Date("2024-07-01") &
+  date <= as.Date("2025-08-31")
+)
+
+env_sub$month <- format(env_sub$date, "%Y-%m")
+
+monthly_temp <- aggregate(
+  Temp_A_LfU_UFP ~ month,
+  data = env_sub,
+  FUN = mean,
+  na.rm = TRUE
+)
+
+monthly_precip <- aggregate(
+  NI_A_LfU_UFP ~ month,
+  data = env_sub,
+  FUN = sum,
+  na.rm = TRUE
+)
+
+monthly <- merge(monthly_temp, monthly_precip, by = "month")
+monthly <- monthly[order(monthly$month), ]
+
+monthly$month_date <- as.Date(paste0(monthly$month, "-01"))
+monthly$month_label <- format(monthly$month_date, "%b %Y")
+monthly$month_id <- seq_len(nrow(monthly))
+
+par(mar = c(8, 4, 4, 5) + 0.1)
+scale_factor <- max(monthly$Temp_A_LfU_UFP, na.rm = TRUE) /
+                max(monthly$NI_A_LfU_UFP, na.rm = TRUE)
+
+temp_max <- max(monthly$Temp_A_LfU_UFP, na.rm = TRUE)
+
+bp <- barplot(monthly$NI_A_LfU_UFP * scale_factor,
+              col = "steelblue",
+              border = "steelblue4",
+              xaxt = "n",
+              #ylim = c(min(monthly$Temp_A_LfU_UFP, na.rm = TRUE),temp_max + 2),
+              ylab = "Mean Temperature (°C)",
+              #xlab = "Month",
+              main = "Monthly Mean Temperature & Total Precipitation")
+
+lines(bp,
+      monthly$Temp_A_LfU_UFP,
+      col = "#FF506E",
+      lwd = 3)
+
+text(x = bp,
+     y = par("usr")[3] - 0.08 * diff(par("usr")[3:4]),
+     labels = monthly$month_label,
+     srt = 45,
+     adj = 1,
+     xpd = TRUE,
+     cex = 0.9)
+
+precip_ticks <- pretty(range(monthly$NI_A_LfU_UFP, na.rm = TRUE))
+
+axis(4,
+     at = precip_ticks * scale_factor,
+     labels = precip_ticks,
+     cex.axis = 0.75)
+
+mtext("Total Precipitation (mm)",
+      side = 4,
+      line = 3)
+
+# legend
+#legend("topright",legend = c("Mean Temperature", "Total Precipitation"),col = c("darkorange2", "steelblue"),lwd = c(3, 10),bty = "n")
+```
+
+
+
+#2. scatterplot of the three lung funciton outcomes
+```{r}
+temp_var <- "env_temp"  # hourly temp
+
+p_list <- lapply(names(outcomes), function(o) {
+  
+  y_var <- outcomes[[o]]$var
+  y_title <- outcomes[[o]]$title
+  
+  ggplot(df, aes_string(x = temp_var, y = y_var)) +
+    geom_point(alpha = 0.4) +
+    geom_smooth(method = "loess", se = TRUE, color = "blue") +
+    labs(
+      x = "Temperature",
+      y = y_title,
+      title = paste("Temperature vs\n", y_title)
+    ) +
+    theme_minimal()
+})
+
+# Combine into one figure
+wrap_plots(p_list, ncol = 3)
+```
+
+```{r}
+plot_list <- lapply(1:10, function(pid) {
+  
+  df_sub <- df %>%
+    filter(ID == pid)
+  
+  p_list <- lapply(names(outcomes), function(o) {
+    
+    y_var <- outcomes[[o]]$var
+    y_title <- outcomes[[o]]$title
+    
+    ggplot(df_sub, aes_string(x = temp_var, y = y_var)) +
+      geom_point(alpha = 0.4) +
+      geom_smooth(method = "loess", se = FALSE, color = "blue") +
+      labs(
+        x = "Temperature",
+        y = y_title,
+        title = paste("ID", pid, "-", y_title)
+      ) +
+      theme_minimal()
+  })
+  
+  wrap_plots(p_list, ncol = 3)
+})
+
+# Display first one
+
+for (i in seq_along(plot_list)) {
+  print(plot_list[[i]])
+}
+```
+
+
+
+
+
+
+#3. Exposures & Outcomes models 
+
+
+#3.1 Daily DLNM
+
+database set-up
+```{r}
+env_var <- "env_temp_ufp"
+#env_var <- "env_precip_ufp"
+
+env_daily <- imp_env %>%
+  mutate(date = as.Date(datetime)) %>%
+  group_by(date) %>%
+  summarise(
+    value = mean(.data[[env_var]], na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(date) %>%
+  mutate(row_id = row_number())
+
+```
+
+hyperparameter set up
+```{r}
+max_lag <- 7
+
+cb_daily <- crossbasis(
+  x = env_daily$value,
+  lag = max_lag,
+  argvar = list(
+    fun = "ns",
+    knots = quantile(env_daily$value, c(0.05, 0.5, 0.95), na.rm = TRUE)
+  ),
+  arglag = list(
+    fun = "ns",
+    #knots = c(1, 3, 5),
+    #knots = logknots(max_lag, 3),
+    intercept = TRUE
+  )
+)
+
+env_key <- env_daily %>%
+  select(date, row_id, value)
+```
+
+```{r}
+df_model <- df %>%
+  mutate(
+    visit_date = as.Date(v2ht_starttime),
+    hourofday = lubridate::hour(v2ht_starttime),
+    weekofyear = lubridate::week(v2ht_starttime)
+  ) %>%
+  left_join(env_key, by = c("visit_date" = "date")) %>%
+  filter(!is.na(row_id), row_id > max_lag)
+```
+
+building the cross visit
+```{r}
+cb_for_visits <- cb_daily[df_model$row_id, , drop = FALSE]
+
+df_model2 <- bind_cols(
+  df_model,
+  as.data.frame(cb_for_visits)
+)
+
+predictor_cols <- colnames(cb_for_visits)
+```
+
+running the model
+```{r}
+models  <- list()
+cp_list <- list()
+
+aic_table <- data.frame(
+  outcome = character(),
+  AIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (o in names(outcomes)) {
+
+  y_var <- outcomes[[o]]$var
+  y_title <- outcomes[[o]]$title
+
+  fml <- as.formula(
+    paste(
+      y_var, "~",
+      paste(predictor_cols, collapse = " + "),
+      "+ ns(weekofyear, df = 4) + hourofday + v2it_smoking + v2it_sex + v2i_panel + v2it_age + v2ht_respinfection + v2ht_cooperation + (1 | ID)"
+    )
+  )
+
+  fit <- lmer(fml, data = df_model2, REML = TRUE)
+  models[[o]] <- fit
+  
+  aic_table <- rbind(
+    aic_table,
+    data.frame(
+      outcome = o,
+      title = y_title,
+      AIC = AIC(fit)
+    )
+  )
+
+  fe <- fixef(fit)
+  V  <- as.matrix(vcov(fit))
+
+  beta_cb <- fe[predictor_cols]
+  V_cb    <- V[predictor_cols, predictor_cols, drop = FALSE]
+
+  cp <- crosspred(
+    basis = cb_daily,
+    coef  = beta_cb,
+    vcov  = V_cb,
+    cen   = 20,
+    at    = quantile(env_daily$value,
+                     probs = seq(0.01, 0.99, 0.01),
+                     na.rm = TRUE)
+  )
+  
+  names(cp)
+  summary(cp$allfit)
+
+  summary(cp$allRRfit)
+
+  cp_list[[o]] <- cp
+
+  # Plot
+  y_title <- outcomes[[o]]$title
+  title <- gsub(" \\(%\\)| \\(mL\\)", "", y_title)
+
+  # Contour plot
+  plot(cp, "contour",
+       xlab = "Temperature (°C)",
+       ylab = "Lag (days)",
+       main = paste(y_title, "- DLNM"),
+       cex.lab = 1.4,   # axis labels
+       cex.main = 1.55,  # title
+       cex.axis = 1.2)  # tick labels
+  
+  # Overall plot
+  plot(cp, "overall",
+       xlab = "Temperature (°C)",
+       ylab = paste0("Δ ", y_title),
+       main = paste(title, "Cumulative Effect (0–7 days)"),
+       cex.lab = 1.5,
+       cex.main = 1.65,
+       cex.axis = 1.3)
+}
+
+print(aic_table)
+```
+
+
+
+#daily DLNM stratified by panel
+```{r}
+models  <- list()
+cp_list <- list()
+
+panels <- sort(unique(df_model2$v2i_panel))
+cols   <- c( "firebrick", "steelblue", "darkgreen")
+
+for (o in names(outcomes)) {
+
+  y_var   <- outcomes[[o]]$var
+  y_title <- gsub(" \\(%\\)| \\(mL\\)", "", outcomes[[o]]$title)
+
+  cat("Running outcome:", o, "\n")
+
+  cp_panel_list <- list()
+  model_panel_list <- list()
+
+  cb_range <- quantile(
+    env_daily$value,
+    probs = seq(0.01, 0.99, 0.01),
+    na.rm = TRUE
+  )
+
+  for (p in panels) {
+
+    cat("  Panel:", p, "\n")
+
+    dat_panel <- subset(df_model2, v2i_panel == p)
+
+    fml <- as.formula(
+      paste(
+        y_var, "~",
+        paste(predictor_cols, collapse = " + "),
+        "+ ns(weekofyear, df = 4)",
+        "+ hourofday",
+        "+ v2it_smoking",
+        "+ v2it_sex",
+        "+ v2it_age",
+        "+ v2ht_respinfection",
+        "+ v2ht_cooperation",
+        "+ (1 | ID)"
+      )
+    )
+
+    fit <- lmer(
+      fml,
+      data = dat_panel,
+      REML = TRUE
+    )
+
+    model_panel_list[[as.character(p)]] <- fit
+
+    fe <- fixef(fit)
+    V  <- as.matrix(vcov(fit))
+
+    beta_cb <- fe[predictor_cols]
+    V_cb <- V[predictor_cols, predictor_cols, drop = FALSE]
+
+    cp <- crosspred(
+      basis = cb_daily,
+      coef  = beta_cb,
+      vcov  = V_cb,
+      cen   = 20,
+      at    = cb_range
+    )
+
+    cp_panel_list[[as.character(p)]] <- cp
+
+    cat(
+      "    non-missing allfit:",
+      sum(is.finite(cp$allfit)),
+      "\n"
+    )
+  }
+
+  models[[o]] <- model_panel_list
+  cp_list[[o]] <- cp_panel_list
+
+  # y limits
+  ylim_vals <- range(
+    unlist(
+      lapply(
+        cp_panel_list,
+        function(x) c(x$alllow, x$allhigh)
+      )
+    ),
+    na.rm = TRUE
+  )
+  
+  y_title <- outcomes[[o]]$title
+  title <- gsub(" \\(%\\)| \\(mL\\)", "", y_title)
+  
+  plot(
+    NULL,
+    xlim = range(cb_range),
+    ylim = ylim_vals,
+    xlab = "Temperature (°C)",
+    ylab = paste0("Δ ", y_title),
+    main = paste(title, "Cumulative Effect by Panel"),
+    cex.lab = 1.5,
+    cex.main = 1.6,
+    cex.axis = 1.3
+  )
+
+# reference line at no effect
+abline(h = 0, col = "grey60", lwd = 1.5, lty = 2)
+
+for (i in seq_along(panels)) {
+  
+  cp <- cp_panel_list[[as.character(panels[i])]]
+  
+  fill_col <- adjustcolor(cols[i], alpha.f = 0.2)
+  
+  polygon(
+    c(cp$predvar, rev(cp$predvar)),
+    c(cp$alllow, rev(cp$allhigh)),
+    col = fill_col,
+    border = NA
+  )
+  
+  lines(
+    cp$predvar,
+    cp$allfit,
+    col = cols[i],
+    lwd = 3
+  )
+}
+
+  for (i in seq_along(panels)) {
+    
+    cp <- cp_panel_list[[as.character(panels[i])]]
+    
+    # semi-transparent fill
+    fill_col <- adjustcolor(cols[i], alpha.f = 0.1)
+    
+    polygon(
+      c(cp$predvar, rev(cp$predvar)),
+      c(cp$alllow, rev(cp$allhigh)),
+      col = fill_col,
+      border = NA
+    )
+    
+    lines(
+      cp$predvar,
+      cp$allfit,
+      col = cols[i],
+      lwd = 3
+    )
+  }
+
+  legend_labels <- c("COPD", "Hypertension", "T2DM")
+  #legend( "topright", legend = legend_labels,col = cols, lwd = 3, bty = "n")
+}
+```
+
+
+
+#hourly DLNM
+Clean imputed environmental series, add a row ID to create the cross-basis and match to the spirometry df
+```{r}
+env_df <- imp_env %>%
+  arrange(datetime) %>%
+  distinct(datetime, .keep_all = TRUE) %>%
+  mutate(row_id = row_number())
+```
+
+building cross-basis
+```{r}
+env_var <- "env_temp_ufp"
+env_var <- "env_humidity_ufp"
+max_lag <- 72
+
+cb_hourly <- crossbasis(
+  x = env_df[[env_var]],
+  lag = max_lag,
+  argvar = list(fun = "ns", knots = c(quantile(env_df[[env_var]], c(0.05, 0.5, 0.95)))),
+  arglag = list(fun = "ns", knots = logknots(max_lag, 3), intercept = TRUE)
+)
+```
+
+```{r}
+env_key <- env_df %>%
+  select(datetime, row_id, all_of(env_var))
+
+df_model <- df %>%
+  mutate(
+    visit_hour = round_date(as.POSIXct(v2ht_starttime, tz = "UTC"), "hour"),
+    hour = hour(visit_hour)
+  ) %>%
+  left_join(env_key, by = c("visit_hour" = "datetime")) %>%
+  filter(!is.na(row_id), row_id > max_lag)
+```
+
+```{r}
+cb_for_visits <- cb_hourly[df_model$row_id, , drop = FALSE]
+
+df_model2 <- bind_cols(
+  df_model,
+  as.data.frame(cb_for_visits)
+)
+
+df_model2 <- df_model2 %>%
+  mutate(month = factor(month(visit_hour)))
+
+predictor_cols <- colnames(cb_for_visits)
+```
+
+run dlnm
+```{r}
+models  <- list()
+cp_list <- list()
+
+
+aic_table <- data.frame(
+  outcome = character(),
+  AIC = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+for (o in names(outcomes)) {
+  
+  y_var <- outcomes[[o]]$var
+  y_title <- outcomes[[o]]$title
+  
+  # Model formula 
+  fml <- as.formula(
+    paste(
+      y_var, "~",
+      paste(predictor_cols, collapse = " + "),
+      "+ ns(weekofyear, df = 4) + ns(env_rel_humidity_daily_mean, df = 3) + hourofday + v2it_smoking + v2it_sex + v2it_age + v2i_panel + v2ht_respinfection + v2ht_cooperation + (1 | ID)"
+    )
+  )
+  
+  # Fit model 
+  fit <- lmer(fml, data = df_model2, REML = FALSE)
+  models[[o]] <- fit
+  
+  
+  aic_table <- rbind(
+    aic_table,
+    data.frame(
+      outcome = o,
+      title = y_title,
+      AIC = AIC(fit)
+    )
+  )
+
+  
+  # Extract coefficients
+  fe <- fixef(fit)
+  V  <- as.matrix(vcov(fit))
+  
+  beta_cb <- fe[predictor_cols]
+  V_cb    <- V[predictor_cols, predictor_cols, drop = FALSE]
+  
+  # Crosspred
+  cp <- crosspred(
+    basis = cb_hourly,
+    coef  = beta_cb,
+    vcov  = V_cb,
+    #cen   = median(env_df[[env_var]], na.rm = TRUE),
+    #cen = quantile(env_df[[env_var]], 0.01, na.rm = TRUE),
+    cen = 21,
+    #cen = 10,
+    at    = quantile(env_df[[env_var]],
+                     probs = seq(0.01, 0.99, 0.01),
+                     na.rm = TRUE)
+  )
+  
+  cp_list[[o]] <- cp
+  
+  # Plots
+  
+  # 1. Contour
+  plot(cp, "contour",
+       xlab = "Temperature",
+       ylab = "Lag (hours)",
+       main = paste(y_title, "- DLNM"))
+  
+  # 2. Cumulative
+  plot(cp, "overall",
+       xlab = "Temperature",
+       ylab = paste0("Δ ", y_title),
+       main = paste(y_title, "Cumulative effect (0–72h)"))
+}
+
+print(aic_table)
+```
+
+plot cummulative effects at extreme temperatures
+```{r}
+# Define percentiles (1st and 99th)
+temp_q <- quantile(env_df[[env_var]],
+                   probs = c(0.01, 0.99),
+                   na.rm = TRUE)
+
+# Generate crosspred (ensure correct lag window)
+cp <- crosspred(
+  basis = cb_hourly,
+  coef  = beta_cb,
+  vcov  = V_cb,
+  cen   = 21,              # reference (change if needed)
+  at    = seq(min(env_df[[env_var]], na.rm = TRUE),
+              max(env_df[[env_var]], na.rm = TRUE),
+              by = 0.1),
+  cumul = TRUE
+)
+
+# Find closest predicted values to 1st and 99th percentiles
+low_idx  <- which.min(abs(cp$predvar - temp_q[1]))
+high_idx <- which.min(abs(cp$predvar - temp_q[2]))
+
+# Extract cumulative effects and CIs
+low_effect  <- cp$allfit[low_idx]
+low_lowCI   <- cp$alllow[low_idx]
+low_highCI  <- cp$allhigh[low_idx]
+
+high_effect <- cp$allfit[high_idx]
+high_lowCI  <- cp$alllow[high_idx]
+high_highCI <- cp$allhigh[high_idx]
+
+# Print results
+cat(sprintf(
+  "Extreme low temperature (%.1f°C): %.1f (95%% CI: %.1f, %.1f)\n",
+  temp_q[1], low_effect, low_lowCI, low_highCI
+))
+
+cat(sprintf(
+  "Extreme high temperature (%.1f°C): %.1f (95%% CI: %.1f, %.1f)\n",
+  temp_q[2], high_effect, high_lowCI, high_highCI
+))
+
+```
+
+
+
+
+
+#GAM functions
+
+GAM delta y
+- we do not need to do change in environmental conditions (x) per person doesn't make as much sense because it's all the same city
+```{r}
+make_gam_change_plot_list <- function(
+    df,
+    outcomes,
+    env_vars,
+    covariates,
+    id_var = "ID"
+) {
+  
+  plot_list <- list()
+  i <- 1
+  
+  df[[id_var]] <- as.factor(df[[id_var]])
+  
+  for (okey in names(outcomes)) {
+    
+    y_var   <- outcomes[[okey]]$var
+    y_title <- outcomes[[okey]]$title
+    
+    for (x in env_vars) {
+      
+      # Clean data
+      vars_needed <- c(id_var, y_var, x, covariates, "month_num")
+      #df_clean <- na.omit(df[, vars_needed])
+      df_clean <- df %>%
+        dplyr::select(all_of(vars_needed)) %>%
+        tidyr::drop_na()
+      
+      # Demean outcome only
+      df_change <- df_clean %>%
+        group_by(.data[[id_var]]) %>%
+        mutate(
+          delta_y = .data[[y_var]] - mean(.data[[y_var]], na.rm = TRUE)
+        )
+      
+      #GAM: Δy ~ absolute x 
+      
+      f <- as.formula(
+        paste(
+          "delta_y ~ s(", x, ", k = 4) +",
+          "s(month_num, bs = 'cc', k = 12) +",
+          "s(", id_var, ", bs = 're') +",    #still using random intercept here-independence assumption
+          paste(covariates, collapse = " + ")
+        )
+      )
+      
+      fit <- mgcv::gam(f, data = df_change, method = "REML")
+      
+      # Prediction grid (absolute x)
+      x_seq <- seq(
+        quantile(df_change[[x]], 0.01, na.rm = TRUE),
+        quantile(df_change[[x]], 0.99, na.rm = TRUE),
+        length.out = 200
+      )
+      
+      # base newdata with x
+      newdata <- setNames(data.frame(x_seq), x)
+      newdata$month_num <- 6.5   # midpoint of 1–12 cycle
+      newdata[[id_var]] <- df_change[[id_var]][1]
+      
+      # add covariates (held constant)
+      for (cov in covariates) {
+        if (is.numeric(df_change[[cov]])) {
+          newdata[[cov]] <- mean(df_change[[cov]], na.rm = TRUE)
+        } else {
+          # for factors → use most common category
+          newdata[[cov]] <- names(sort(table(df_change[[cov]]), decreasing = TRUE))[1]
+        }
+      }
+      
+      # Predict
+      pred <- predict(
+        fit,
+        newdata = newdata,
+        se.fit = TRUE,
+        exclude = paste0("s(", id_var, ")")
+      )
+      
+      newdata$fit   <- pred$fit
+      newdata$lower <- pred$fit - 1.96 * pred$se.fit
+      newdata$upper <- pred$fit + 1.96 * pred$se.fit
+      
+      # Percentiles
+      x5  <- quantile(df_change[[x]], 0.05, na.rm = TRUE)
+      x95 <- quantile(df_change[[x]], 0.95, na.rm = TRUE)
+      
+      # Outcome-specific limits
+      ylim_vals <- switch(
+        okey,
+        FEV1FVC = c(-2, 2),
+        FEV1    = c(-50, 50),
+        FVC     = c(-70, 60),
+        c(-50, 50)
+      )
+      
+      # Plot
+      p <- ggplot() +
+        geom_ribbon(
+          data = newdata,
+          aes(x = .data[[x]], ymin = lower, ymax = upper),
+          fill = "lightblue",
+          alpha = 0.3
+        ) +
+        geom_line(
+          data = newdata,
+          aes(x = .data[[x]], y = fit),
+          color = "black",
+          linewidth = 0.9
+        ) +
+        geom_vline(xintercept = x5,  linetype = 2, color = "gray40") +
+        geom_vline(xintercept = x95, linetype = 2, color = "gray40") +
+        coord_cartesian(ylim = ylim_vals) +
+        labs(
+          title = nice_env_labels(x),
+          y = paste0("Δ ", y_title),
+          x = nice_env_labels(x)
+        ) +
+        theme_classic(base_size = 9) +
+        theme(
+          plot.title   = element_text(size = 9, hjust = 0.5),
+          axis.title.y = element_text(size = 8),
+          axis.text    = element_text(size = 5)
+        )
+      
+      plot_list[[i]] <- p
+      i <- i + 1
+    }
+  }
+  
+  return(plot_list)
+}
+```
+
+
+run GAM across different environmental factors
+```{r}
+#extra rows make formatting better
+env_vars <- c("env_temp_daily_mean","env_temp_night_mean", "env_temp_daily_sd","env_temp_daily_min","env_temp_daily_max","env_PM25_daily_mean","env_PM10_daily_mean","env_bc_880_daily_mean","env_precip_daily_mean","env_abs_humidity_daily_mean","env_rel_humidity_daily_mean","env_rel_humidity_daily_mean")
+
+#env_vars <- c("log_env_PM25_daily_mean","log_env_PM10_daily_mean","log_env_bc_880_daily_mean","log_env_precip_daily_mean")
+```
+
+```{r}
+cov_fixed <- c("v2ht_respinfection","v2it_sex", "v2it_age", "v2i_panel", "v2it_smoking")
+
+plot_list <- make_gam_change_plot_list(
+  df               = df,
+  outcomes         = outcomes,
+  env_vars         = env_vars,
+  covariates       = c("v2ht_respinfection", "v2it_sex", "v2it_age", "v2i_panel", "v2it_smoking"),
+  id_var           = "ID"
+)
+```
+
+```{r}
+paginate_exposure_plots(
+  plot_list = plot_list,
+  outcomes  = outcomes,
+  env_vars  = env_vars,
+  n_cols    = 4
+)
+```
+
+
+run GAM across different temperature metrics
+```{r}
+env_vars <- c("env_temp_last3h","env_temp_last7h","env_temp_daily_mean","env_temp_yesterday","env_temp_last2d","env_temp_last4d","env_temp_last7d","env_temp_last14d","temp_diff_yesterday","temp_diff_weekly", "temp_diff_weekly", "temp_diff_weekly")
+```
+
+```{r}
+plot_list <- make_gam_change_plot_list(
+  df               = df,
+  outcomes         = outcomes,
+  env_vars         = env_vars,
+  covariates       = cov_fixed,
+  id_var           = "ID"
+)
+
+paginate_exposure_plots(
+  plot_list = plot_list,
+  outcomes  = outcomes,
+  env_vars  = env_vars,
+  n_cols    = 4
+)
+```
+
+
+
+
+#GEE
+
+GEE linear/nonlinear, delta y function
+```{r}
+make_gee_change_plot_list <- function(
+    df,
+    outcomes,
+    env_vars,
+    covariates,
+    y_limits_manual,
+    id_var = "ID",
+    nonlinear = FALSE   
+) {
+  plot_list <- list()
+  results_list <- list()
+  i <- 1
+  r <- 1
+  
+  df[[id_var]] <- as.factor(df[[id_var]])
+  
+  for (okey in names(outcomes)) {
+    
+    y_var   <- outcomes[[okey]]$var
+    y_title <- outcomes[[okey]]$title
+    
+    for (x in env_vars) {
+      
+      vars_needed <- c(id_var, y_var, x, covariates, "month_num", "hourofday", "weekofyear")
+      
+      df_clean <- df[, vars_needed] %>%
+        na.omit() %>%
+        arrange(.data[[id_var]], month_num) %>%
+        group_by(.data[[id_var]]) %>%
+        mutate(delta_y = .data[[y_var]] - mean(.data[[y_var]], na.rm = TRUE)) %>%
+        ungroup()
+      
+      #chose linear or nonlinear
+      if (nonlinear) {
+        #knots <- quantile(df_clean[[x]], c(0.25, 0.5, 0.75), na.rm = TRUE)
+        #knots <- unique(knots) 
+        #knots_str <- paste(knots, collapse = ", ")
+        #x_term <- paste0("ns(", x, ", knots = c(", knots_str, "))")
+        x_term <- paste0("ns(", x, ", df = 3)")
+        
+      } else {
+        x_term <- x
+      }
+      
+      # --- model ---
+      f <- as.formula(
+        paste(
+          "delta_y ~",
+          x_term,
+          #"+ ns(month_num, df = 4) +",
+          "+ sin(2*pi*weekofyear/52) + cos(2*pi*weekofyear/52) +",    #(testing looping)
+          paste(covariates, collapse = " + ")
+        )
+      )
+      
+      fit <- geepack::geeglm(
+        formula = f,
+        id      = df_clean[[id_var]],
+        data    = df_clean,
+        family  = gaussian,
+        corstr  = "ar1"
+      )
+      
+      if (!nonlinear) {
+        summ <- summary(fit)
+        coef_row <- summ$coefficients[x, ]
+        
+        results_list[[r]] <- data.frame(
+          outcome  = okey,
+          exposure = x,
+          beta     = as.numeric(coef_row["Estimate"]),
+          se       = as.numeric(coef_row["Std.err"]),
+          p_value  = as.numeric(coef_row["Pr(>|W|)"]),
+          stringsAsFactors = FALSE
+        )
+        
+        r <- r + 1
+      }
+      
+      # --- Prediction ---
+      x_seq <- seq(
+        quantile(df_clean[[x]], 0.01, na.rm = TRUE),
+        quantile(df_clean[[x]], 0.99, na.rm = TRUE),
+        length.out = 100
+      )
+      
+      newdata <- setNames(data.frame(x_seq), x)
+      
+      for (cv in covariates) {
+        newdata[[cv]] <- if (is.numeric(df_clean[[cv]])) {
+          median(df_clean[[cv]], na.rm = TRUE)
+        } else {
+          factor(levels(df_clean[[cv]])[1], levels = levels(df_clean[[cv]]))
+        }
+      }
+      
+      newdata$month_num <- median(df_clean$month_num, na.rm = TRUE)
+      newdata$weekofyear <- median(df_clean$weekofyear, na.rm = TRUE)
+      newdata$hourofday <- factor(
+        round(median(df_clean$hourofday, na.rm = TRUE)),
+        levels = sort(unique(df_clean$hourofday))
+      )
+      
+      # --- design matrix ---
+      X <- model.matrix(delete.response(terms(fit)), newdata)
+      beta <- coef(fit)
+      vcov_mat <- vcov(fit)
+      
+      newdata$pred <- as.vector(X %*% beta)
+      newdata$se   <- sqrt(diag(X %*% vcov_mat %*% t(X)))
+      
+      newdata$lower <- newdata$pred - 1.96 * newdata$se
+      newdata$upper <- newdata$pred + 1.96 * newdata$se
+      
+      # center
+      ref <- newdata$pred[1]
+      newdata$pred  <- newdata$pred  - ref
+      newdata$lower <- newdata$lower - ref
+      newdata$upper <- newdata$upper - ref
+      
+      # percentiles
+      x5  <- quantile(df_clean[[x]], 0.05, na.rm = TRUE)
+      x95 <- quantile(df_clean[[x]], 0.95, na.rm = TRUE)
+      
+      ylim_vals <- switch(
+        okey,
+        FEV1FVC = c(-2, 2),
+        FEV1    = c(-77, 75),
+        FVC     = c(-75, 75),
+        c(-50, 50)
+      )
+      
+      p <- ggplot(newdata, aes(x = .data[[x]], y = pred)) +
+        geom_ribbon(
+          aes(ymin = lower, ymax = upper),
+          fill = "lightblue", alpha = 0.4
+        ) +
+        geom_line(color = "black", linewidth = 0.8) +
+        geom_vline(xintercept = x5,  linetype = 2, color = "gray40") +
+        geom_vline(xintercept = x95, linetype = 2, color = "gray40") +
+        geom_hline(yintercept = 0, linetype = 2, color = "gray40") +
+        coord_cartesian(ylim = ylim_vals) +
+        labs(
+          title = nice_env_labels(x),
+          y = paste0("Δ ", y_title),
+          x = nice_env_labels(x)
+        ) +
+        theme_classic(base_size = 7)
+      
+      plot_list[[i]] <- p
+      i <- i + 1
+    }
+  }
+  
+  results_df <- if (!nonlinear) {
+    do.call(rbind, results_list) %>%
+      dplyr::mutate(exposure = nice_env_labels(exposure)) %>%
+      dplyr::arrange(exposure, outcome)
+  } else {
+    NULL
+  }
+  
+  return(list(
+    plots = plot_list,
+    results = results_df
+  ))
+}
+```
+
+
+outcome variables
+```{r}
+env_vars <- c("env_temp_daily_mean","env_temp_daily_sd","env_temp_daily_min","env_temp_daily_max","env_PM25_daily_mean","env_PM10_daily_mean","env_bc_880_daily_mean","env_precip_daily_mean","env_abs_humidity_daily_mean","env_rel_humidity_daily_mean","env_rel_humidity_daily_mean","env_rel_humidity_daily_mean")
+
+env_vars <- c("env_temp_last3h","env_temp_last7h","env_temp_daily_mean","env_temp_yesterday","env_temp_last2d","env_temp_last4d","env_temp_last7d","env_temp_last14d","temp_diff_yesterday","temp_diff_weekly", "temp_diff_weekly", "temp_diff_weekly")
+```
+
+```{r}
+cov_fixed <- c("v2ht_respinfection")
+
+res <- make_gee_change_plot_list(
+  df               = df,
+  outcomes         = outcomes,
+  env_vars         = env_vars,
+  covariates       = cov_fixed,
+  y_limits_manual  = y_limits_manual,
+  id_var           = "ID",
+  nonlinear = TRUE
+)
+```
+
+#non linear
+```{r}
+results_df <- res$results %>%
+  dplyr::mutate(
+    exposure_pretty = nice_env_labels(exposure),
+    beta = round(beta, 3),
+    se   = round(se, 3),
+    p_value = signif(p_value, 3)
+  ) %>%
+  dplyr::select(
+    outcome,
+    exposure = exposure_pretty,
+    beta,
+    se,
+    p_value
+  ) %>%
+  dplyr::arrange(exposure, outcome)
+```
+
+```{r}
+results_df
+
+plot_list <- res$plots
+
+paginate_exposure_plots(
+  plot_list = plot_list,
+  outcomes  = outcomes,
+  env_vars  = env_vars,
+  n_cols    = 4
+)
+```
+
+#linear
+```{r}
+cov_fixed <- c("v2ht_respinfection")
+
+res <- make_gee_change_plot_list(
+  df               = df,
+  outcomes         = outcomes,
+  env_vars         = env_vars,
+  covariates       = cov_fixed,
+  y_limits_manual  = y_limits_manual,
+  id_var           = "ID"
+)
+
+
+results_df <- res$results %>%
+  dplyr::mutate(
+    exposure_pretty = nice_env_labels(exposure),
+    beta = round(beta, 3),
+    se   = round(se, 3),
+    p_value = signif(p_value, 3)
+  ) %>%
+  dplyr::select(
+    outcome,
+    exposure = exposure_pretty,
+    beta,
+    se,
+    p_value
+  ) %>%
+  dplyr::arrange(exposure, outcome)
+```
+
+```{r}
+results_df
+
+plot_list <- res$plots
+
+paginate_exposure_plots(
+  plot_list = plot_list,
+  outcomes  = outcomes,
+  env_vars  = env_vars,
+  n_cols    = 4
+)
+```
+
+
+
+
+#pooled models (linear regression for each participant ID)
+```{r}
+iqr_df <- sapply(env_vars, function(x) {
+  IQR(df[[x]], na.rm = TRUE)
+})
+
+iqr_df <- data.frame(
+  exposure = names(iqr_df),
+  IQR = as.numeric(iqr_df),
+  stringsAsFactors = FALSE
+)
+```
+
+variables
+```{r}
+env_vars <- c("env_temp_daily_mean","env_temp_daily_sd","env_temp_daily_min","env_temp_daily_max","env_PM25_daily_mean","env_PM10_daily_mean","env_bc_880_daily_mean","env_precip_daily_mean","env_abs_humidity_daily_mean","env_rel_humidity_daily_mean")
+
+env_vars <- c("env_temp_last3h","env_temp_last7h","env_temp_daily_mean","env_temp_yesterday","env_temp_last2d","env_temp_last4d","env_temp_last7d","env_temp_last14d","temp_diff_yesterday","temp_diff_weekly")
+```
+
+```{r}
+run_individual_models <- function(
+    df,
+    outcomes,
+    env_vars,
+    covariates,
+    id_var = "ID",
+    nonlinear = FALSE
+) {
+  
+  results_list <- list()
+  r <- 1
+  
+  for (okey in names(outcomes)) {
+    
+    y_var <- outcomes[[okey]]$var
+    
+    for (x in env_vars) {
+      
+      # prepare data
+      df_clean <- df %>%
+        select(all_of(c(id_var, y_var, x, covariates, "month_num"))) %>%
+        na.omit() %>%
+        group_by(.data[[id_var]]) %>%
+        mutate(delta_y = .data[[y_var]] - mean(.data[[y_var]], na.rm = TRUE)) %>%
+        ungroup()
+      
+      # loop over individuals
+      ids <- unique(df_clean[[id_var]])
+      
+      for (id_val in ids) {
+        
+        df_id <- df_clean %>%
+          filter(.data[[id_var]] == id_val)
+        
+        # skip if too few observations
+        if (nrow(df_id) < 10) next
+        
+        # exposure term
+        if (nonlinear) {
+          x_term <- paste0("ns(", x, ", df = 3)")
+        } else {
+          x_term <- x
+        }
+        
+        
+        cov_keep <- covariates[sapply(covariates, function(cv) {
+          length(unique(df_id[[cv]])) > 1
+        })]
+
+        
+        # formula
+        
+        f <- as.formula(
+          paste(
+            "delta_y ~",
+            x_term,
+            "+ sin(2*pi*month_num/12) + cos(2*pi*month_num/12)",
+            if (length(cov_keep) > 0) paste("+", paste(cov_keep, collapse = " + ")) else ""
+          )
+        )
+
+        
+        # fit model
+        fit <- lm(f, data = df_id)
+        
+        if (!nonlinear) {
+          coef_row <- summary(fit)$coefficients[x, ]
+          
+          results_list[[r]] <- data.frame(
+            ID       = id_val,
+            outcome  = okey,
+            exposure = x,
+            beta     = coef_row["Estimate"],
+            se       = coef_row["Std. Error"],
+            p_value  = coef_row["Pr(>|t|)"],
+            n_obs    = nrow(df_id),
+            stringsAsFactors = FALSE
+          )
+          
+          r <- r + 1
+        }
+      }
+    }
+  }
+  
+  results_df <- do.call(rbind, results_list)
+  
+  # aggregate (mean effect across individuals)
+  summary_df <- results_df %>%
+    group_by(outcome, exposure) %>%
+    summarise(
+      mean_beta = mean(beta, na.rm = TRUE),
+      sd_beta   = sd(beta, na.rm = TRUE),
+      n_ids     = n(),
+      .groups = "drop"
+    )
+  
+  return(list(
+    individual_results = results_df,
+    summary_results = summary_df
+  ))
+}
+```
+
+```{r}
+res_indiv <- run_individual_models(
+  df          = df,
+  outcomes    = outcomes,
+  env_vars    = env_vars,
+  covariates  = covariates <- c("hourofday", "v2ht_respinfection", "v2ht_cooperation"),
+  nonlinear   = FALSE   # or TRUE
+)
+
+res_indiv$individual_results
+```
+
+```{r}
+iv_results <- res_indiv$individual_results %>%
+  filter(!is.na(beta), !is.na(se), se > 0) %>%
+  mutate(weight = 1 / (se^2)) %>%
+  group_by(outcome, exposure) %>%
+  summarise(
+    pooled_beta = sum(weight * beta) / sum(weight),
+    pooled_se   = sqrt(1 / sum(weight)),
+    lower_95    = pooled_beta - 1.96 * pooled_se,
+    upper_95    = pooled_beta + 1.96 * pooled_se,
+    n_ids       = n(),
+    .groups = "drop"
+  )
+```
+
+```{r}
+iv_results_iqr <- iv_results %>%
+  left_join(iqr_df, by = "exposure") %>%
+  mutate(
+    beta_IQR  = pooled_beta * IQR,
+    lower_IQR = lower_95 * IQR,
+    upper_IQR = upper_95 * IQR,
+    result_str = sprintf(
+      "%.2f (95%% CI: %.2f, %.2f)",
+      beta_IQR, lower_IQR, upper_IQR
+    )
+  ) %>%
+  select(outcome, exposure, result_str)
+```
+
+
+```{r}
+# Variables of interest
+vars_iqr <- c(
+  "env_precip_daily_mean",         # Daily average precipitation
+  "env_abs_humidity_daily_mean",   # Daily average absolute humidity
+  "env_rel_humidity_daily_mean",   # Daily average relative humidity
+  "env_temp_last3h",               # Previous 3 hours average temperature
+  "env_temp_daily_mean",           # Daily average temperature
+  "env_temp_last14d"               # 2-week average temperature
+)
+
+# Calculate IQRs
+iqr_values <- data.frame(
+  Variable = vars_iqr,
+  IQR = sapply(vars_iqr, function(v) IQR(df[[v]], na.rm = TRUE))
+)
+
+print(iqr_values)
+```
+
+
+histogram of each var
+```{r}
+ggplot(res_indiv$individual_results, aes(x = beta)) +
+  geom_histogram(bins = 30, fill = "lightblue", color = "black") +
+  facet_grid(outcome ~ exposure, scales = "free") +
+  theme_classic()
+```
+
+```{r}
+# create prediction grid for each exposure
+plot_df <- iv_results %>%
+  group_by(outcome, exposure) %>%
+  do({
+    x_vals <- seq(-2, 2, length.out = 100)  # standardized scale (or change)
+
+    data.frame(
+      x = x_vals,
+      effect = .$pooled_beta * x_vals,
+      lower  = .$lower_95 * x_vals,
+      upper  = .$upper_95 * x_vals,
+      outcome = .$outcome,
+      exposure = .$exposure
+    )
+  }) %>%
+  ungroup()
+```
+
+```{r}
+ggplot(plot_df, aes(x = x, y = effect)) +
+  geom_ribbon(aes(ymin = lower, ymax = upper),
+              fill = "lightblue", alpha = 0.4) +
+  geom_line(color = "black", linewidth = 1) +
+  geom_hline(yintercept = 0, linetype = 2) +
+  facet_grid(outcome ~ exposure, scales = "free") +
+  labs(
+    title = "Pooled Linear Exposure–Response",
+    x = "Exposure (scaled)",
+    y = "Change in outcome"
+  ) +
+  theme_classic()
+```

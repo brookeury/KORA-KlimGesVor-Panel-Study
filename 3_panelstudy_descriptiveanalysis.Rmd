@@ -1,0 +1,1118 @@
+
+This file represents an exploration of descriptive analyses
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(tidyr)
+library(writexl)
+library(lubridate)
+library(purrr)
+library(corrplot)
+```
+
+load the rdf file (which includes the factors)
+```{r}
+clean_df <- readRDS()
+envraw <- read.csv()
+```
+
+
+#1. Temperature major statistics
+```{r}
+clean_df %>%
+  summarize(
+    n = sum(!is.na(env_temp)),
+    mean = mean(env_temp, na.rm = TRUE),
+    sd = sd(env_temp, na.rm = TRUE),
+    var = var(env_temp, na.rm = TRUE),
+    min = min(env_temp, na.rm = TRUE),
+    q25 = quantile(env_temp, 0.25, na.rm = TRUE),
+    median = median(env_temp, na.rm = TRUE),
+    q75 = quantile(env_temp, 0.75, na.rm = TRUE),
+    max = max(env_temp, na.rm = TRUE),
+    range = max - min,
+    IQR = IQR(env_temp, na.rm = TRUE)
+  )
+``` 
+
+#2. correlation for environmental variables
+```{r}
+env_data <- data.frame("date" = as.Date(envraw$date_neu, format = "%d-%B-%Y"))
+env_data$hour <- envraw$Hour
+env_data$datetime <- as.POSIXct(paste(env_data$date, env_data$hour), 
+                                format = "%Y-%m-%d %H", tz = "UTC")
+```
+
+add UFP data variables
+- temperature, Pm2.5, Pm10, black carbon, humidity, precipitation
+```{r}
+env_data$env_temp_ufp <- envraw$Temp_A_LfU_UFP
+env_data$env_PM25_ufp <- envraw$PM25_A_LfU_UFP
+env_data$env_PM10_ufp <- envraw$PM10_A_LfU_UFP
+env_data$env_humidity_ufp <- envraw$Feuchte_A_LfU_UFP
+env_data$env_precip_ufp <- envraw$NI_A_LfU_UFP
+env_data$env_bc_880_ufp <- envraw$BC_880_A_LfU_UFP
+```
+
+```{r}
+numeric_df <- env_data %>% 
+  select(where(is.numeric)) %>%
+  select(-hour) %>%
+  select(starts_with("env_temp"), everything())
+
+clean_names <- gsub("_ufp", "", names(numeric_df))
+clean_names <- gsub("env_", "", clean_names)
+clean_names <- gsub("_avg", "", clean_names)
+colnames(numeric_df) <- clean_names
+
+cor_mat <- cor(numeric_df, use = "pairwise.complete.obs", method = "pearson")
+
+corrplot(cor_mat, method = "color", type = "upper",
+         tl.col = "black", 
+         tl.cex = 0.8, 
+         addCoef.col = "black",
+         number.cex = 0.6)
+```
+
+
+#3. calculate the number of visits for each participant
+remove visits with missing spirometry data
+```{r}
+visit_summary <- clean_df %>%
+  filter(!is.na(v2ht_starttime)) %>%
+  group_by(ID) %>%
+  summarise(num_visits = n(), .groups = "drop") %>%
+  count(num_visits, name = "num_participants") %>%
+  mutate(percent = num_participants / sum(num_participants) * 100)
+```
+
+#4. Explore covariates and outcomes
+
+separate datasets based on variables -- column layouts differ
+```{r}
+#medication df
+df_med <- clean_df %>%
+  select(ID, v2x_visit, v2i_panel, v2h_examdate, starts_with("ATC"))
+
+#spirometry df
+df_spirometry <- clean_df %>%
+  select(ID, v2x_visit, v2i_panel, starts_with("v2h"))
+
+#covariates
+df_covariates <- clean_df %>%
+  select(
+    -starts_with("ATC", ignore.case = TRUE),
+    -starts_with("v2h", ignore.case = TRUE)
+  )
+```
+
+
+#4.1 start with covariates dataset
+
+group based on participant id (one row per participant)
+- Get the baseline value for all characteristics. Height and weight recorded every time. All other variables were only recorded at the first visit.
+```{r}
+df <- df_covariates %>%
+  group_by(ID) %>%
+  filter(v2x_visit == 1) %>%
+  ungroup()
+```
+
+
+functions to create plots and table 1
+
+create plots
+```{r}
+make_plots <- function(df, meta, bin_width) {
+  
+  plot_list <- list()
+  
+  for (v in names(meta)) {
+    
+    label  <- meta[[v]]$label
+    values <- meta[[v]]$values
+    
+    # categorical variables
+    if (!is.null(values)) {
+      
+      p <- ggplot(df, aes(x = factor(.data[[v]]))) +
+        geom_bar(fill = "chartreuse4") +
+        scale_x_discrete(labels = values) +
+        labs(
+          title = label,
+          x = label,
+          y = "Count"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title  = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 5),
+          axis.title.x = element_blank(),
+          axis.text    = element_text(size = 6)
+        )
+      
+    } else {
+      # continuous variables
+      p <- ggplot(df, aes(x = .data[[v]])) +
+        geom_histogram(
+          fill = "chartreuse4",
+          binwidth = bin_width[[v]]
+        ) +
+        labs(
+          title = label,
+          x = label,
+          y = "Count"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title  = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 5),
+          axis.title.x = element_blank(),
+          axis.text    = element_text(size = 5)
+        )
+    }
+    
+    plot_list[[v]] <- p
+  }
+  
+  return(plot_list)
+}
+```
+
+create table 1
+```{r}
+make_table1 <- function(df, meta) {
+  
+  table1_list <- list()
+  
+  for (v in names(meta)) {
+    
+    var_info <- meta[[v]]
+    
+    #categorical variables
+    if (!is.null(var_info$values)) {
+      
+      tab <- df %>%
+        mutate(
+          val = factor(
+            .data[[v]],
+            levels = names(var_info$values),
+            labels = var_info$values
+          )
+        ) %>%
+        
+        group_by(v2i_panel, val) %>%
+        summarise(n = n(), .groups = "drop") %>%
+        
+        pivot_wider(
+          names_from = v2i_panel,
+          values_from = n,
+          values_fill = 0
+        ) %>%
+        
+        mutate(All = rowSums(across(-val))) %>%
+        
+        mutate(across(
+          -c(val, All),
+          ~ paste0(.x, " (", round(.x / sum(.x) * 100, 1), "%)")
+        )) %>%
+        
+        mutate(All = paste0(All, " (", round(All / sum(All) * 100, 1), "%)")) %>%
+        
+        mutate(variable = var_info$label, category = val) %>%
+        select(variable, category, All, everything(), -val)
+      
+      # Fisher's exact test
+      chi_tab <- table(df[[v]], df$v2i_panel)
+      pval <- tryCatch(
+        fisher.test(chi_tab)$p.value,
+        error = function(e) NA
+      )
+      
+      tab <- tab %>%
+        mutate(`p-value` = round(pval, 3))
+      
+      table1_list[[v]] <- tab
+      
+    } else {
+      
+      #continuous variables
+      tab <- df %>%
+        group_by(v2i_panel) %>%
+        summarise(
+          mean_val = mean(.data[[v]], na.rm = TRUE),
+          sd_val   = sd(.data[[v]], na.rm = TRUE),
+          .groups = "drop"
+        ) %>%
+        
+        mutate(mean_sd = paste0(
+          round(mean_val, 1), " (", round(sd_val, 1), ")"
+        )) %>%
+        
+        select(v2i_panel, mean_sd) %>%
+        pivot_wider(names_from = v2i_panel, values_from = mean_sd) %>%
+        
+        mutate(All = paste0(
+          round(mean(df[[v]], na.rm = TRUE), 1),
+          " (",
+          round(sd(df[[v]], na.rm = TRUE), 1),
+          ")"
+        )) %>%
+        
+        mutate(variable = var_info$label, category = "") %>%
+        select(variable, category, All, everything())
+      
+      # ANOVA
+      aov_model <- aov(df[[v]] ~ df$v2i_panel)
+      pval <- summary(aov_model)[[1]][["Pr(>F)"]][1]
+      
+      tab <- tab %>%
+        mutate(`p-value` = round(pval, 3))
+      
+      table1_list[[v]] <- tab
+    }
+  }
+  
+  # Combine all variables into one table
+  bind_rows(table1_list)
+}
+```
+
+
+#4.1.1 demographics
+```{r}
+#categorical
+demographics_meta <- list(
+  v2i_panel = list(
+    label = "Panel",
+    values = c(
+      "COPD" = "COPD",
+      "Hypertonie" = "Hypertension",
+      "T2DM" = "Type 2\n Diabetes")),
+  
+  v2it_age = list(
+    label  = "Age"),
+  
+  v2it_sex = list(
+    label  = "Sex", 
+    values = c("1" = "Male", "2" = "Female")), #sex transformed and sex are equivalent
+
+  v2it_borngermany = list(
+    label  = "Born in Germany",
+    values = c("1" = "Yes", "0" = "No")),
+
+  v2i_marital = list(
+    label  = "Marital Status",
+    values = c(
+      "1" = "Married",
+      "2" = "Single",
+      "3" = "Divorced",
+      "4" = "Widowed")),
+
+  pt_eduqual = list(
+    label  = "Highest Vocational\nQualification",
+    values = c(
+      "1" = "No\nqualification",
+      "2" = "Vocational\nschool/\nApprenticeship",
+      "3" = "Technician/\nMaster\nschool",
+      "4" = "Engineering school/\nPolytechnic",
+      "5" = "Technical\ncollege/\nUniversity")),
+
+  pt_eduyears = list(
+    label = "Years of Schooling"),
+  
+  v2it_employment = list(
+    label  = "Employment",
+    values = c(
+      "1"    = "Full-time",
+      "2"    = "Part-time",
+      "3"    = "Retired",
+      "4"    = "Unemp-\nloyed")),
+  
+  v2it_equivalizedincomecategories = list(
+    label = "Equivalized Household\n Income Compared\nto Median",
+     values = c(
+      "1"  = "Under\n50%",
+      "2"  = "Under\n100%",
+      "3"  = "Under\n150%",
+      "4"  = "Under\n200%",
+      "5"  = "over\n200%"))
+)
+  
+#continuous
+demographics_binwidth <- c(
+  pt_eduyears = 1,
+  v2it_equivalizedincome = 300,
+  v2it_age = 3
+)
+```
+
+```{r}
+demographics_table1 <- make_table1(df, demographics_meta)
+
+plots <- make_plots(df, demographics_meta, demographics_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 3)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+#4.1.2 health behaviors
+```{r}
+# Categorical variables metadata
+healthbehaviors_meta <- list(
+  v2it_livepartner = list(
+    label  = "Live with Partner",
+    values = c("1" = "Yes", "0" = "No")),
+  
+  v2it_smoking = list(
+    label  = "Smoking Status",
+    values = c(
+      "1" = "current\nsmoker", 
+      "2" = "previous\nsmoker",
+      "0" = "never/smoker")),
+  
+  v2i_numcigarettes = list(
+    label  = "Number of Cigarettes\nper Day"),
+  
+  v2it_othertobacco = list(
+    label  = "Smoking Status\n(Other Tobacco Products)",
+    values = c("1" = "Yes", "0" = "No")),
+  
+  v2it_secondhandsmoke = list(
+    label  = "Secondhand Smoke Exposure",
+    values = c("1" = "Yes", "0" = "No")),
+  
+  v2i_wintersports = list(
+    label  = "Sports in Winter",
+    values = c(
+      "1" = ">2\nhs/week",
+      "2" = "1-2\nhs/week",
+      "3" = "<1 hour\n/week",
+      "4" = "No activity")),
+  
+  v2i_summersports = list(
+    label  = "Sports in Summer",
+    values = c(
+      "1" = ">2\nhs/week",
+      "2" = "1-2\nhs/week",
+      "3" = "<1 hour\n/week",
+      "4" = "No activity"))
+)
+
+# Continuous/numeric variables bin width
+healthbehaviors_binwidth <- list(
+  v2i_numcigarettes = 3
+)
+```
+
+```{r}
+healthbehaviors_table1 <- make_table1(df, healthbehaviors_meta)
+
+plots <- make_plots(df, healthbehaviors_meta, healthbehaviors_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 3)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+#4.1.3 self-reported exposures
+```{r}
+exposures_meta <- list(
+  v2i_homeheating = list(
+    label  = "Home Heating Method",
+    values = c(
+      "1" = "Central/external\nheat source",
+      "2" = "Single stove or\nburner inside dwelling")),
+  v2it_gascooking = list(
+    label  = "Gas Stove Used\nfor Cooking",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_coolhome = list(
+    label  = "Living Area Can Be Kept\nCool on Hot Days",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_ac = list(
+    label  = "Air Conditioning at Home",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_sunwork = list(
+    label  = "Exposure to Direct\nSunlight at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_directcoldwork = list(
+    label  = "Exposure to Direct\nCold at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_acwork = list(
+    label  = "Air Conditioning\nat Workplace",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_heatwork = list(
+    label  = "Exposure to Technical\nHeat Sources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_coldwork = list(
+    label  = "Exposure to Technical\nCold Sources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_moisturework = list(
+    label  = "Exposure to Moisture\nSources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_uniformwork = list(
+    label  = "Prescribed Work Clothing\n(Uniform / Protective Clothing)",
+    values = c("1" = "Yes", "0" = "No"))
+)
+
+exposures_binwidth <- list()
+```
+
+```{r}
+exposures_table1 <- make_table1(df, exposures_meta)
+
+plots <- make_plots(df, exposures_meta, exposures_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 4)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+#4.1.4 health status
+```{r}
+# Categorical variables metadata
+healthstatus_meta <- list(
+  v2i_selfhealth = list(
+    label  = "Self-rated Health",
+    values = c(
+      "1" = "Very good",
+      "2" = "Good",
+      "3" = "Less good",
+      "4" = "Bad")),
+  v2i_selfhealthcompared = list(
+    label  = "Self-rated Health Compared\nto Same Age Peers",
+    values = c(
+      "1" = "Better",
+      "3" = "No change",
+      "2" = "Worse",
+      "4" = "don't\nknow")),
+  v2it_diabetes = list(
+    label  = "Diabetes",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_hypertension = list(
+    label  = "High Blood Pressure",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_sleepapnea = list(
+    label  = "Sleep Apnea",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_hayfever = list(
+    label  = "Hay Fever",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_asthma = list(
+    label  = "Asthma",
+    values = c("1" = "Yes,\ncurrent", "2" = "Yes,\n cured", "0" = "No")),
+  v2it_coughsymptoms = list(
+    label  = "Cough Symptoms",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_sputumsymptoms = list(
+    label  = "Sputum Symptoms",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_copd = list(
+    label  = "COPD",
+    values = c("1" = "Yes", "0" = "No")),
+  v2it_emphysema = list(
+    label  = "Emphysema",
+    values = c("1" = "Yes", "0" = "No"))
+)
+
+healthstatus_binwidths <- list()
+```
+
+```{r}
+healthstatus_table1 <- make_table1(df, healthstatus_meta)
+
+plots <- make_plots(df, healthstatus_meta, healthstatus_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 4)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+#4.1.5 anthropometry
+```{r}
+anthropometry_meta <- list(
+  v2it_height = list(
+    label = "Height (cm)"),
+  v2it_weight = list(
+    label = "Weight (kg)"),
+  v2it_waist = list(
+    label = "Waist Circumference (cm)"),
+  v2it_hip = list(
+    label = "Hip Circumference (cm)"),
+  v2i_bmi = list(
+    label = "BMI"),
+  v2it_bmiclass = list(
+    label = "BMI",
+    values = c(
+      "0" = "Underweight",
+      "1" = "Normal",
+      "2" = "Overweight",
+      "3" = "Obese")),
+  v2it_whr = list(
+    label = "Waist Hip Ratio"),
+  v2it_whrclass = list(
+    label = "Waist-Hip Ratio",
+    values = c(
+      "0" = "Low risk",
+      "1" = "High risk"))
+)
+
+# Continuous / numeric variables bin width
+anthropometry_binwidth <- list(
+  v2it_height = 2,
+  v2it_weight = 3,
+  v2it_waist  = 3,
+  v2it_hip    = 3,
+  v2i_bmi     = 1,
+  v2it_whr    = 0.05
+)
+```
+
+```{r}
+anthropometry_table1 <- make_table1(df, anthropometry_meta)
+
+plots <- make_plots(df, anthropometry_meta, anthropometry_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 4)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+
+
+#5. medication
+A10   Diabetes
+C02   Direct antihypertensives
+C03   Diuretics
+C07 	Beta-blockers
+C08 	Calcium channel blockers
+C09 	ACE inhibitors & ARBs
+S01G	Decongestants and anti-allergens
+R01A	Decongestants and othe tropical rhinologicals
+R03   Asthma, COPD, Bronchodilators
+R06   Allergies (antihistamines)
+
+get the number of participants recording medication
+
+collapse on each participant ID, only include those select variables
+```{r}
+df_med_small <- df_med %>%
+  group_by(ID) %>%
+  summarise(
+    v2i_panel = first(v2i_panel),
+    across(
+      c(ATC_R03, ATC_R06, ATC_S01G, ATC_R01A, ATC_A10, ATC_C02, ATC_C03, ATC_C07, ATC_C08, ATC_C09),
+      ~ as.integer(any(.x == 1, na.rm = TRUE))
+    )
+  )
+```
+
+get the counts and percent of each arm that take the medication 
+```{r}
+medications <- c("ATC_R03","ATC_R06","ATC_S01G","ATC_R01A","ATC_A10",
+                 "ATC_C02","ATC_C03","ATC_C07","ATC_C08","ATC_C09")
+
+table_list <- list()
+
+for (med in medications){
+
+  # counts
+  table <- df_med_small %>%
+    group_by(v2i_panel, !!sym(med)) %>% 
+    summarize(n = n(), .groups = "drop") %>%
+    pivot_wider(names_from = v2i_panel, values_from = n, values_fill = 0)
+
+  # fisher test
+  chi_tab <- table %>% select(-all_of(med))
+
+  pval <- tryCatch(
+    fisher.test(chi_tab)$p.value,
+    error = function(e) NA
+  )
+
+  # add percentages + clean
+  table <- table %>%
+    mutate(All = rowSums(across(-all_of(med)))) %>%
+    mutate(across(-all_of(med),
+                  ~ paste0(.x, " (", round(.x / sum(.x) * 100, 1), "%)"))) %>%
+    ungroup() %>%
+    mutate(
+      variable = med,
+      'p-value' = round(pval, 3)
+    ) %>%
+    relocate(variable) %>%
+    relocate(All, .after = all_of(med)) %>%
+    rename(category = all_of(med))
+
+  table_list[[length(table_list) + 1]] <- table
+}
+
+medications_table1 <- bind_rows(table_list)
+```
+
+get the number of medications each participant takes
+(note that this isn't ideal bc it doesn't have all potential medications)
+```{r}
+total_meds <- df_med_small %>%
+  mutate(
+    total_meds = rowSums(across(c(ATC_R03, ATC_R06, ATC_S01G, ATC_R01A, ATC_A10, 
+                                  ATC_C02, ATC_C03, ATC_C07, ATC_C08, ATC_C09)))) %>%
+  select (total_meds, ID, v2i_panel) %>%
+  count(v2i_panel, total_meds) %>%
+  tidyr::pivot_wider(
+    names_from = total_meds,
+    values_from = n,
+    values_fill = 0
+  )
+
+total_meds
+```
+
+
+#6. environmental exposures
+ 
+```{r}
+#categorical
+environmentalexposures_meta <- list(
+  env_temp_ufp_daily = list(
+    label  = "Daily Temperature"),
+  env_PM25_ufp_daily = list(
+    label  = "Daily PM2.5"),
+  env_PM10_ufp_daily = list(
+    label  = "Daily PM10"),
+  env_humidity_ufp_daily = list(
+    label  = "Daily Humidity"),
+  env_bc_880_ufp_daily = list(
+    label  = "Daily Black Carbon")
+)
+  
+#continuous
+environmentalexposures_binwidth <- c(
+  env_temp_ufp_daily = 1,
+  env_PM25_ufp_daily = 1,
+  env_PM10_ufp_daily = 2,
+  env_humidity_ufp_daily = 3,
+  env_bc_880_ufp_daily = 50
+)
+```
+
+```{r}
+environmentalexposures_table1 <- make_table1(df, environmentalexposures_meta)
+
+plots <- make_plots(df, environmentalexposures_meta, environmentalexposures_binwidth)
+
+combined_plot <- wrap_plots(plots, ncol = 3, nrow = 4)
+combined_plot
+
+ggsave("", combined_plot,
+       width = 7, height = 5, dpi = 600)
+```
+
+
+
+#7. Combine all variables into one larger Table 1
+```{r}
+table1 <- rbind(demographics_table1,
+                healthbehaviors_table1,
+                healthstatus_table1,
+                anthropometry_table1,
+                exposures_table1,
+                medications_table1,
+                environmentalexposures_table1)
+
+write_xlsx(table1, path = "")
+```
+
+
+
+#8. look at the variables that change over time (excluding pulmonary function)
+anthropometric: height, weight
+medications: "R03","R06","S01G","R01A","A10","C02","C03","C07","C08","C09"
+id, visit number, date
+      
+weight changes over time
+```{r}
+change_df <- clean_df %>%
+  group_by(ID) %>%
+  summarise(
+    # baseline & final (last observed visit)
+    baseline_weight = v2it_weight[v2x_visit == 1][1],
+    final_weight    = v2it_weight[v2x_visit == max(v2x_visit, na.rm = TRUE)][1],
+    last_visit      = max(v2x_visit, na.rm = TRUE),
+
+    # change scores
+    weight_change = final_weight - baseline_weight,
+    # weight descriptives across visits
+    weight_min   = min(v2it_weight, na.rm = TRUE),
+    weight_max   = max(v2it_weight, na.rm = TRUE),
+    weight_range = weight_max - weight_min,
+    weight_sd    = sd(v2it_weight, na.rm = TRUE),
+
+    .groups = "drop"
+  )
+```
+
+plot weight changes over time
+```{r}
+stats <- c("weight")
+
+# Create empty list to store the plots
+plots <- list()
+
+# Loop through stats (weight)
+for(stat in stats) {
+  # create 3 plots
+  plots[[paste0(stat, "_range")]] <- ggplot(change_df, aes_string(x = paste0(stat, "_range"))) +
+    geom_histogram(bins = 20, fill = "steelblue", color = "black") +
+    labs(title = paste0("Range of ", stat), x = paste0("Range of ", stat), y = "Count") +
+    theme_minimal()
+
+  plots[[paste0(stat, "_change")]] <- ggplot(change_df, aes_string(x = paste0(stat, "_change"))) +
+    geom_histogram(bins = 20, fill = "steelblue", color = "black") +
+    labs(title = paste0("Change in ", stat), x = paste0("Change in ", stat), y = "Count") +
+    theme_minimal()
+
+  plots[[paste0(stat, "_sd")]] <- ggplot(change_df, aes_string(x = paste0(stat, "_sd"))) +
+    geom_histogram(bins = 20, fill = "steelblue", color = "black") +
+    labs(title = paste0("SD of ", stat), x = paste0("SD of ", stat), y = "Count") +
+    theme_minimal()
+}
+
+# Combine all plots using patchwork
+combined_plot <- (plots$weight_range | plots$weight_change | plots$weight_sd)
+
+# Display the combined plot
+combined_plot
+
+```
+
+look at medication use across seasons and months
+```{r}
+# Example of medication columns
+medications <- c("ATC_R03","ATC_R06","ATC_S01G","ATC_R01A","ATC_A10",
+                 "ATC_C02","ATC_C03","ATC_C07","ATC_C08","ATC_C09")
+
+# Create a new column for the season, month
+clean_df <- clean_df %>%
+  mutate(
+    v2h_examdate = as.POSIXct(v2h_examdate),
+    season = case_when(
+      month(v2h_examdate) %in% c(12, 1, 2) ~ "Winter",
+      month(v2h_examdate) %in% c(3, 4, 5) ~ "Spring",
+      month(v2h_examdate) %in% c(6, 7, 8) ~ "Summer",
+      month(v2h_examdate) %in% c(9, 10, 11) ~ "Fall",
+      TRUE ~ NA_character_
+    ),
+    month = lubridate::floor_date(v2h_examdate, "month")
+  )
+
+# Summarize the number of medications used per season
+medication_summary <- clean_df %>%
+  group_by(season) %>%
+  summarise(across(all_of(medications), ~ sum(. == 1, na.rm = TRUE), .names = "med_{.col}"),
+            .groups = "drop")
+print(medication_summary)
+
+# Summarize monthly counts for each medication
+monthly_summary <- clean_df %>%
+  group_by(month) %>%
+  summarise(across(all_of(medications),
+                   ~ sum(. == 1, na.rm = TRUE),
+                   .names = "{.col}"),
+            .groups = "drop") %>%
+  pivot_longer(cols = all_of(medications),
+               names_to = "medication",
+               values_to = "count")
+
+# Time series plot (faceted)
+ggplot(monthly_summary, aes(x = month, y = count, color = medication)) +
+  geom_line(linewidth = 1) +
+  facet_wrap(~ medication, scales = "free_y") +
+  labs(title = "Monthly Medication Usage Over Time",
+       x = "Month",
+       y = "Count of Usage") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+```
+
+
+
+
+
+
+#9. Look at the distribution across three arms
+continuous
+```{r}
+make_histogram_plots <- function(df, var, var_name) {
+  var <- sym(var)   # convert string to symbol
+  
+  # create one plot per subject type
+  plots <- df %>%
+    split(.$v2i_panel) %>%
+    lapply(function(d) {
+      ggplot(d, aes(x = !!var)) +
+        geom_histogram(
+          fill = "steelblue",
+          binwidth = 3
+        ) +
+        scale_y_continuous(limits = c(0, 11)) +
+        labs(
+          title = paste(var_name, " —", unique(d$v2i_panel)),
+          x = var_name,
+          y = "Count"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title  = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 5),
+          axis.title.x = element_blank(),
+          axis.text    = element_text(size = 5)
+        )
+    })
+  
+  # arrange in a 3×3 grid
+  p <- wrap_plots(plots, ncol = 3, nrow = 3)
+  return(p)
+}
+```
+
+categorical
+```{r}
+make_categorical_plots <- function(df, var, var_name, labels) {
+  var <- sym(var)
+
+  plots <- df %>%
+    split(.$v2i_panel) %>%
+    lapply(function(d) {
+
+      # Ensure all categories appear in every subset
+      d <- d %>% mutate(
+        !!var := factor(as.character(!!var), levels = names(labels))
+      )
+
+      ggplot(d, aes(x = !!var)) +
+        geom_bar(fill = "steelblue") +
+        scale_x_discrete(labels = labels, drop = FALSE) +
+        scale_y_continuous(limits = c(0, 27)) +
+        labs(
+          title = paste(var_name, "—", unique(d$v2i_panel)),
+          x = var_name,
+          y = "Count"
+        ) +
+        theme_minimal() +
+        theme(
+          plot.title  = element_text(size = 10, face = "bold"),
+          axis.title.y = element_text(size = 5),
+          axis.title.x = element_blank(),
+          axis.text    = element_text(size = 5)
+        )
+    })
+
+  wrap_plots(plots, ncol = 3, nrow = 3)
+}
+```
+
+
+age
+```{r}
+p_age <- make_histogram_plots(df, "v2it_age", "Age")
+p_age
+```
+
+sex
+```{r}
+p_sex <- make_categorical_plots(
+  df,
+  var = "v2it_sex",
+  var_name = "Sex",
+  labels = c("1" = "Male", "2" = "Female")
+)
+
+p_sex
+```
+
+income
+```{r}
+p_income <- make_categorical_plots(
+  df,
+  var = "v2it_equivalizedincomecategories",
+  var_name = "Equivalized Income",
+  labels = c("1" = "50%", "2" = "100%", "3" = "150%", "4" = "200%", "5" = "over\n200%")
+)
+
+p_income
+```
+
+smoking
+```{r}
+p_smoking <- make_categorical_plots(
+  df,
+  var = "v2it_smoking",
+  var_name = "Smoking",
+  labels = c("1" = "current\nsmoker", "2" = "previous\nsmoker", "0" = "never\nsmoker")
+)
+
+p_smoking
+```
+
+BMI (with dashed lines for overweight/obesity)
+```{r}
+# create one plot per subject type
+plots <- df %>%
+  split(.$v2i_panel) %>%
+  lapply(function(d) {
+    ggplot(d, aes(x = v2i_bmi)) +
+      geom_histogram(
+        fill = "steelblue",
+        binwidth = 2
+      ) +
+      geom_vline(xintercept = 25, color = "red", linetype = "dashed", size = 0.6) +
+      geom_vline(xintercept = 30, color = "red", linetype = "dashed", size = 0.6) +
+      scale_y_continuous(limits = c(0, 11)) +
+      scale_x_continuous(limits = c(17, 47)) +
+      labs(
+        title = paste("BMI — ", unique(d$v2i_panel)),
+        x = "BMI",
+        y = "Count"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title  = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 5),
+        axis.title.x = element_blank(),
+        axis.text    = element_text(size = 5)
+      )
+  })
+
+# arrange them in a 3×3 grid
+p_bmi <- wrap_plots(plots, ncol = 3, nrow = 3)
+
+p_bmi
+```
+
+whr, also stratified by gender (with dashed lines for abdominal obesity)
+```{r}
+plots_whr <- df %>%
+  split(list(.$v2i_panel, .$v2it_sex), drop = TRUE) %>%
+  lapply(function(d) {
+
+    # choose threshold by sex
+    thr <- ifelse(unique(d$v2it_sex) == "2", 0.85, 1.0)
+    sex_label <- ifelse(unique(d$v2it_sex) == 1, "male", "female")
+
+    ggplot(d, aes(x = v2it_whr)) +
+      geom_histogram(fill = "darkorange", binwidth = 0.02) +
+      geom_vline(xintercept = thr, color = "red", linetype = "dashed", size = 0.6) +
+      scale_y_continuous(limits = c(0, 6)) +
+      coord_cartesian(xlim = c(0.73, 1.17)) +
+      labs(
+        title = paste("WHR — ", unique(d$v2i_panel), "/", sex_label),
+        x = "Waist–Hip Ratio",
+        y = "Count"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title  = element_text(size = 10, face = "bold"),
+        axis.title.y = element_text(size = 5),
+        axis.title.x = element_blank(),
+        axis.text    = element_text(size = 5)
+      )
+  })
+
+p_whr <- wrap_plots(plots_whr, ncol = 3, nrow = 4)
+p_whr
+```
+
+
+combing the occupational exposures into one graph (restricting to those who work)
+```{r}
+workexposures_meta <- list(
+  v2i_sunwork = list(
+    label  = "Exposure to Direct\nSunlight at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_directcoldwork = list(
+    label  = "Exposure to Direct\nCold at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_acwork = list(
+    label  = "Air Conditioning\nat Workplace",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_heatwork = list(
+    label  = "Exposure to Technical\nHeat Sources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_coldwork = list(
+    label  = "Exposure to Technical\nCold Sources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_moisturework = list(
+    label  = "Exposure to Moisture\nSources at Work",
+    values = c("1" = "Yes", "0" = "No")),
+  v2i_uniformwork = list(
+    label  = "Prescribed Work Clothing\n(Uniform / Protective Clothing)",
+    values = c("1" = "Yes", "0" = "No"))
+)
+```
+
+```{r}
+vars <- names(workexposures_meta)
+
+# Recode values using meta list
+df_long <- df %>%
+  filter(v2i_employmenttype != 4) %>% # Filter out those that are not employed
+  mutate(across(all_of(vars), ~ workexposures_meta[[cur_column()]]$values[as.character(.)])) %>%
+  pivot_longer(cols = all_of(vars), names_to = "variable", values_to = "response")
+
+# Count only "Yes"
+yes_counts <- df_long %>%
+  filter(response == "Yes") %>%
+  group_by(variable) %>%
+  summarise(count_yes = n()) %>%
+  ungroup() %>%
+  mutate(label = map_chr(variable, ~ workexposures_meta[[.x]]$label))
+
+plot_list <- list()
+
+p <- ggplot(yes_counts, aes(x = reorder(label, count_yes), y = count_yes)) +
+      geom_bar(stat = "identity", fill = "chartreuse4") +
+      labs(
+        title = "Occupational Exposures",
+        x = "Exposures",
+        y = "Count"
+      ) +
+      theme_minimal() +
+      theme(
+        plot.title  = element_text(size = 13.5, face = "bold"),
+        axis.title.y = element_text(size = 5),
+        axis.title.x = element_blank(),
+        axis.text    = element_text(size = 5)
+      )
+
+plot_list[[1]] <- p
+
+combined_plot <- wrap_plots(plot_list, ncol = 1, nrow = 3)
+combined_plot
+```
+
+
+
+
+
+
+

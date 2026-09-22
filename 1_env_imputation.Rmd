@@ -1,0 +1,274 @@
+
+This coding file conducts imputation on the environmental variables. Note that we are only imputing environmental variables.
+
+```{r}
+library(dplyr)
+library(tableone)
+library(kableExtra)
+library(missForest)
+library(doParallel)
+```
+
+load datasets
+```{r}
+df <- readRDS()
+
+envraw <- read.csv()
+```
+
+restrict to visits with valid lung funciton data (used to check # of missing)
+```{r}
+df <- df %>% filter(!is.na(v2ht_starttime))
+```
+
+
+
+#1. testing missing
+get number of missing for all variables
+```{r}
+all_vars <- names(df)
+
+missing_df <- data.frame(
+  variable = all_vars,
+  n_missing = sapply(df[all_vars], function(x) sum(is.na(x))),
+  pct_missing = sapply(df[all_vars], function(x) mean(is.na(x)) * 100)
+)
+```
+
+get number of missing in env dataset
+```{r}
+all_vars <- names(envraw)
+missing_df_env <- data.frame(
+  variable = all_vars,
+  n_missing = sapply(envraw[all_vars], function(x) sum(is.na(x))),
+  pct_missing = sapply(envraw[all_vars], function(x) mean(is.na(x)) * 100)
+)
+```
+
+dates where UFP data is missing
+```{r}
+ufp_vars <- c("PM25_A_LfU_UFP", "PM25_A_LfU_UFP", "BC_880_A_LfU_UFP", "Temp_A_LfU_UFP", "Druck_A_LfU_UFP", "Feuchte_A_LfU_UFP", "NI_A_LfU_UFP")
+```
+
+```{r}
+mask_missing_any <- rowSums(is.na(envraw[ufp_vars])) > 0
+bad_dates_any    <- unique(envraw$date_neu[mask_missing_any])
+bad_dates_any    <- bad_dates_any[!is.na(bad_dates_any)]  # drop NA dates if present
+parts <- do.call(rbind, strsplit(bad_dates_any, "-", fixed = TRUE))
+bad_dates_any <- bad_dates_any[order(match(parts[,2], month.name),
+                                     as.integer(parts[,1]))]
+print(bad_dates_any)
+```
+
+
+
+
+#2. prepare the dataset for imputation
+
+```{r}
+X <- envraw
+
+#make sure the date columns are right
+X$date_neu <- as.Date(X$date_neu, format = "%d-%B-%Y")
+#need the time zone to ensure daylight savings is accounted for
+X$datetime <- as.POSIXct(paste(X$date_neu, X$Hour), format = "%Y-%m-%d %H", tz = "UTC")
+```
+
+```{r}
+X$time_num   <- as.numeric(X$datetime)   # seconds since 1970
+X$Hour       <- as.integer(format(X$datetime, "%H"))
+X$doy        <- as.integer(format(X$datetime, "%j"))   # 1–365
+X$month      <- as.integer(format(X$datetime, "%m"))
+X$date_neu <- NULL
+X$datetime <- NULL
+```
+
+```{r}
+all_vars <- names(X)
+missing_df_env <- data.frame(
+  variable = all_vars,
+  n_missing = sapply(X[all_vars], function(x) sum(is.na(x))),
+  pct_missing = sapply(X[all_vars], function(x) mean(is.na(x)) * 100)
+)
+```
+
+check how variables will be imputed
+```{r}
+#column types and missingness
+col_class <- vapply(X, function(z) class(z)[1], character(1))
+n_mis     <- vapply(X, function(z) sum(is.na(z)), integer(1))
+pct_mis   <- round(100 * n_mis / nrow(X), 2)
+
+# missForest: numeric/integer -> regression; factor/ordered/character -> classification
+is_num_like   <- col_class %in% c("numeric","integer")
+is_factor_like<- col_class %in% c("factor","ordered","character","logical")
+
+method <- ifelse(is_num_like, "regression",
+          ifelse(is_factor_like, "classification", "UNSUPPORTED (check)"))
+
+# Build a data.frame summary
+imp_plan <- data.frame(
+  variable   = names(X),
+  class      = col_class,
+  n_missing  = n_mis,
+  pct_missing= pct_mis,
+  method     = method,
+  will_impute= n_mis > 0 & method != "UNSUPPORTED (check)",
+  row.names  = NULL
+)
+```
+
+#3. Missing Forest with 100 trees
+runtime: 3 minutes
+```{r}
+no_cores <- detectCores() - 2     #leave 2 cores left  
+cl <- makeCluster(no_cores)  
+registerDoParallel(cl)
+
+set.seed(809)
+
+res_100tree <- missForest(X, 
+                    verbose = TRUE, 
+                    ntree = 100, 
+                    parallelize = "forests",
+                    variablewise = TRUE) 
+
+imp_100tree <- res_100tree$ximp
+```
+
+
+
+#report error per variable
+```{r}
+# Per-variable OOB errors (NRMSE for numeric variables)
+err_100tree <- res_100tree$OOBerror
+rmse <- sqrt(err_100tree)
+sd_vec <- sapply(X, sd, na.rm = TRUE)
+nrmseerr_100tree <- rmse / sd_vec
+
+names(nrmseerr_100tree) <- colnames(X)
+
+nrmsetable_100tree <- data.frame(
+  variable = names(nrmseerr_100tree),
+  NRMSE    = round(nrmseerr_100tree, 3),
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+
+print(nrmsetable_100tree)
+```
+
+
+#4. Testing IssForest with 500 trees
+runtime: 11 minutes
+```{r}
+no_cores <- detectCores() - 2     #leave 2 cores left  
+cl <- makeCluster(no_cores)  
+registerDoParallel(cl)
+
+set.seed(809)
+
+res_500tree <- missForest(X, 
+                    verbose = TRUE, 
+                    ntree = 500, 
+                    parallelize = "forests",
+                    variablewise = TRUE) 
+
+imp_500tree <- res_500tree$ximp
+
+stopCluster(cl)
+registerDoSEQ()
+```
+
+report error per variable
+```{r}
+# Per-variable OOB errors (NRMSE for numeric variables)
+err_500tree <- res_500tree$OOBerror
+rmse <- sqrt(err_500tree)
+sd_vec <- sapply(X, sd, na.rm = TRUE)
+nrmseerr_500tree <- rmse / sd_vec
+
+names(nrmseerr_500tree) <- colnames(X)
+
+nrmsetable_500tree <- data.frame(
+  variable = names(nrmseerr_500tree),
+  NRMSE    = round(nrmseerr_500tree, 3),
+  row.names = NULL,
+  stringsAsFactors = FALSE
+)
+
+print(nrmsetable_500tree)
+```
+
+
+#5. compare complete case to the random forest imputation
+- results are pretty similar, perhaps slighty better for 500 forests
+```{r}
+#complete case
+desc_cc <- CreateTableOne(data = X) 
+desc_cc <- print(desc_cc)
+
+#imputed ds
+desc_imp_100 <- CreateTableOne(data = imp_100tree)
+desc_imp_100 <- print(desc_imp_100)
+
+#imputed ds 2 (more trees)
+desc_imp_500 <- CreateTableOne(data = imp_500tree)
+desc_imp_500 <- print(desc_imp_500)
+
+#cbind and rename colnames 
+desc <- cbind(desc_cc, desc_imp_100, desc_imp_500)
+colnames(desc) <- c("Complete case", "100 trees", "500 trees")
+
+kable(desc, format = "markdown", caption = "Table 1: Comparison between complete-case and imputed dataset (parallelize = 'forests'")
+```
+
+
+#6. prepare the imputed dataset
+```{r}
+imp_env_initial <- imp_500tree
+```
+
+correct date information
+```{r}
+imp_env_initial$datetime <- as.POSIXct(
+  imp_env_initial$time_num,
+  origin = "1970-01-01",
+  tz = "UTC"
+)
+```
+
+add UFP data variables
+- temperature, Pm2.5, Pm10, black carbon, humidity, precipitation
+```{r}
+# Keep only datetime + selected UFP variables
+imp_env <- imp_env_initial %>%
+  transmute(
+    datetime,
+    env_temp_ufp     = Temp_A_LfU_UFP,
+    env_PM25_ufp     = PM25_A_LfU_UFP,
+    env_PM10_ufp     = PM10_A_LfU_UFP,
+    env_humidity_ufp = Feuchte_A_LfU_UFP,
+    env_precip_ufp   = NI_A_LfU_UFP,
+    env_bc_880_ufp   = BC_880_A_LfU_UFP
+  )
+```
+
+confirm number of missing is 0
+```{r}
+all_vars <- names(imp_env)
+missing_df_env <- data.frame(
+  variable = all_vars,
+  n_missing = sapply(imp_env[all_vars], function(x) sum(is.na(x))),
+  pct_missing = sapply(imp_env[all_vars], function(x) mean(is.na(x)) * 100)
+)
+```
+
+
+#save imputed dataset
+save as csv for reference, but also save as rds to converse datetime
+```{r}
+write.csv(imp_env)
+saveRDS(imp_env)
+```
+

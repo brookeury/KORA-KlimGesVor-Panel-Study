@@ -1,0 +1,994 @@
+
+This coding file updates all the variables based on the data dictionary and puts those most relevant into a dataset called "data"
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(rspiro)
+library(slider)
+library(zoo)
+```
+
+#1 load datasets
+```{r}
+df_original <- read.csv()
+df_householdcomposition <- read.csv()
+```
+
+joint datasets
+```{r}
+df_original <- full_join(df_original, df_householdcomposition, by = "zz_nr")
+```
+
+create dataset to input cleaned variables
+```{r}
+data <- data.frame(ID = as.factor(df_original$zz_id))
+```
+
+
+#2 basic transformations/feature engineering
+v2x: visit information
+v2i : V2 interview
+v2it: transformed variable from the V2 interview
+pt: education variables
+v2h: lung function protocol
+v2ht: transformed variable from the lung function protocol
+ATC: medication codes
+
+visit number, date, and time
+```{r}
+data$v2x_visit <- df_original$v2t_visit
+
+data$v2h_examdate  <- as.POSIXct(df_original$v2cuntdat, format = "%d%b%Y:%H:%M:%S", tz = "UTC")
+data$v2ht_starttime <- as.POSIXct(df_original$v2h_23_1, format = "%d%b%Y:%H:%M:%S", tz = "UTC")
+data$v2ht_endtime   <- as.POSIXct(df_original$v2h_23_2, format = "%d%b%Y:%H:%M:%S", tz = "UTC")
+
+data$v2ht_starttime <- as.POSIXct(
+  paste(as.Date(data$v2h_examdate), format(data$v2ht_starttime, "%H:%M:%S")),
+  format = "%Y-%m-%d %H:%M:%S", tz = "UTC"
+)
+
+data$v2ht_endtime <- as.POSIXct(
+  paste(as.Date(data$v2h_examdate), format(data$v2ht_endtime, "%H:%M:%S")),
+  format = "%Y-%m-%d %H:%M:%S", tz = "UTC"
+)
+
+# Create month factor
+data$month <- as.factor(format(data$v2ht_starttime, "%m"))
+```
+
+
+
+demographics
+```{r}
+data$v2it_sex <- as.factor(as.character(df_original$v2csex)) # 1/2 male/female
+data$v2it_age <- df_original$v2tb_alteru
+data$v2it_borngermany <- factor(ifelse(df_original$v2dt == 1, "1",
+                                       ifelse(df_original$v2dt == 2, "0", NA))) # 1/0 yes/no
+data$v2i_panel <- as.factor((df_original$v2tb_panel)) #COPD/Hypertonie/T2DM
+data$v2i_marital <- as.factor((df_original$v2c011)) #1/2/3/4 married/single/divorced/widowed
+data$v2it_livepartner <- factor(ifelse(df_original$v2c012 == 1, "1",
+                                       ifelse(df_original$v2c012 == 2, "0", NA))) # 1/0 yes/no
+
+#education
+data$pt_eduqual<- as.factor((df_original$ptberufb)) 
+#1 = no qualification, 2 = Vocational school / Apprenticeship, 3 = technician school / master school, 4 = Engineering school / Polytechnic, 5 = technical college / university 
+data$pt_eduyears <- df_original$ptedyrs #8-17 years
+```
+
+
+employment
+```{r}
+# 1 = Registered as unemployed, 2 = Housewife/husband, 3 = In training or retraining, 5 = On maternity/parental leave, other leave of absence, 6 = In the non-working phase of partial retirement, 4 = Retired 
+data$v2i_unemploymenttype <- replace(df_original$v2c017, df_original$v2c017 < 0 , NA) 
+
+# 1 = Yes, full-time, 2 = Yes, regularly employed part-time, 3 = Yes, employed on a minimal or irregular basis, 4 = No
+data$v2i_employmenttype <- replace(df_original$v2c016, df_original$v2c016 < 0 , NA) 
+
+# 1 = full-time, 2 = part-time, 3 = retired, 4 = unemployed (one missing value, where someone reported not working, but did not indicate if they were retired)
+data$v2it_employment <- dplyr::case_when(
+  # Employed (employmenttype ≠ 4)
+  data$v2i_employmenttype == 1 ~ 1,
+  data$v2i_employmenttype %in% c(2, 3) ~ 2,
+
+  # Unemployed (employmenttype = 4)
+  data$v2i_employmenttype == 4 & data$v2i_unemploymenttype %in% c(4, 6) ~ 3,
+  #assume this participant with missing data is retired bc they are well over 65
+  data$v2i_employmenttype == 4 & is.na(data$v2i_unemploymenttype) ~ 3, 
+  data$v2i_employmenttype == 4 & data$v2i_unemploymenttype %in% c(1, 2, 3, 5) ~ 4,
+
+  TRUE ~ NA_real_
+)
+
+data$v2i_employmenttype <- as.factor(as.character(data$v2i_employmenttype))
+data$v2i_unemploymenttype <- as.factor(as.character(data$v2i_unemploymenttype))
+data$v2it_employment <- as.factor(as.character(data$v2it_employment))
+```
+
+
+calculating equivalized income (from modified OECD scale)
+first adult: 1, all others over 14: 0.5, children under 14: 0.3
+```{r}
+data$v2it_income <- replace(df_original$v2a1_3, df_original$v2a1_3 >= 99 , NA) 
+data$v2it_income <- as.factor(as.character(data$v2it_income))
+median_values <- c("1" = 250, "2" = 625, "3" = 875, "4" = 1250, "5" = 1750, "6" = 2250,
+                   "7" = 2750, "8" = 3250, "9" = 3750, "10" = 4250, "11" = 4750,
+                   "12" = 5250, "13" = 5500, "14" = 6500 #can change this value, group is over 6000
+)
+
+data$v2it_income <- as.numeric(median_values[data$v2it_income])
+
+data$v2it_equivalizedincome <- ifelse(
+  df_original$v2a1_1 == 1,
+  data$v2it_income,
+  round(
+    data$v2it_income /
+      (1 + 0.5 * (df_original$v2a1_2_1 + df_original$v2a1_2_4 - 1) +
+         0.3 * (df_original$v2a1_2_2 + df_original$v2a1_2_3)), 0)
+)
+
+#equivalized income based on categories (50%, 100%, 150%, 200%, and over 200% equivalized income)
+data$v2it_equivalizedincomecategories <- cut(
+  data$v2it_equivalizedincome,
+  breaks = c(-Inf, 625, 1250, 1875, 2500, Inf),
+  labels = c(1, 2, 3, 4, 5),
+  right = FALSE
+)
+
+#poverty indicator, using median equivalized income, or 625
+data$v2it_povertyindicator <- factor(
+  ifelse(data$v2it_equivalizedincome < 625, 1, 0),
+  levels = c(1, 0)
+)
+```
+
+behaviors
+```{r}
+#smoking
+# 1/0 yes/no
+data$v2it_currentsmoking <- factor(ifelse(df_original$v2c068 == 1, "1",
+                                       ifelse(df_original$v2c068 == 2, "0", NA)))
+# 1/2 regularly/occasionally
+data$v2i_smokingfrequency <- replace(df_original$v2c070, df_original$v2c070 < 0 , NA)
+data$v2i_smokingfrequency <- as.factor(as.character(data$v2i_smokingfrequency))
+data$v2i_numcigarettes <- replace(df_original$v2c071, df_original$v2c071 < 0 , NA)
+# 0/1/2  no/yes (regularly)/yes (occasionally)
+data$v2it_eversmoked <- factor(ifelse(df_original$v2c073 == 3, "0", df_original$v2c073))
+# 1/0 yes/no
+data$v2it_othertobacco <- factor(ifelse(df_original$v2c077a == 1, "1",
+                                        ifelse(df_original$v2c077a == 2, "0", NA)))
+# 1/0 yes/no
+data$v2it_secondhandsmoke <- factor(ifelse(df_original$v2_rauchen1 == 1, "1",
+                                           ifelse(df_original$v2_rauchen1 == 2, "0", NA)))
+
+# new variable for current smoker / previous smoker / non-smoker (1/2/0)
+data$v2it_smoking <- factor(ifelse(data$v2it_currentsmoking == 1, 1,
+                                   ifelse(data$v2it_eversmoked %in% c(1, 2), 2,
+                                          ifelse(data$v2it_eversmoked == 0, 0, NA)))
+)
+
+#physical activity
+# 1 = Regularly more than 2 hours per week, 2 = Regularly 1 to 2 hours per week, 3 = Less than 1 hour per week, 4 = No sporting activity in winter
+data$v2i_wintersports <- as.factor(as.character(df_original$v2c094))
+data$v2i_summersports <- as.factor(as.character(df_original$v2c095))
+```
+
+exposures 
+the data dictionary says 2 = no, but assuming here that 0 = np
+```{r}
+#1 = stove/burner/heat source outside the dwelling, 2 = single stove/burner in the dwelling 
+data$v2i_homeheating <- as.factor(as.character(df_original$v2umw1a))
+# 1/0 yes/no
+data$v2it_gascooking <- factor(ifelse(df_original$v2umw2 == 1, "1",
+                                           ifelse(df_original$v2umw2 == 2, "0", NA)))
+# 1/0 yes/no
+data$v2it_coolhome <- factor(ifelse(df_original$v2umw3  == 1, "1",
+                                           ifelse(df_original$v2umw3  == 2, "0", NA)))
+# 1 = Yes, I use it regularly, 2 = Yes, I use it only occasionally, 3 = Yes, but I don't use it , 4 = No
+data$v2it_ac <- factor(ifelse(df_original$v2umw4  %in% c(1,2,3), "1",
+                                           ifelse(df_original$v2umw4  == 4, "0", NA)))
+
+# a = gas, b = oil, c = electricity, d = wood, e = coal, coke, briquettes
+data$v2it_heatingsource <- as.factor(as.character(
+  ifelse(df_original$v2umw1b_a == 1, "a",
+  ifelse(df_original$v2umw1b_b == 1, "b",
+  ifelse(df_original$v2umw1b_c == 1, "c",
+  ifelse(df_original$v2umw1b_d == 1, "d",
+  ifelse(df_original$v2umw1b_e == 1, "e", NA)))))
+))
+
+# occupational exposures. 1/0 yes/no
+data$v2i_sunwork        <- factor(replace(df_original$v2arb10_a, df_original$v2arb10_a < 0, NA))
+data$v2i_directcoldwork <- factor(replace(df_original$v2arb10_b, df_original$v2arb10_b < 0, NA))
+data$v2i_acwork         <- factor(replace(df_original$v2arb10_c, df_original$v2arb10_c < 0, NA))
+data$v2i_heatwork       <- factor(replace(df_original$v2arb10_d, df_original$v2arb10_d < 0, NA))
+data$v2i_coldwork       <- factor(replace(df_original$v2arb10_e, df_original$v2arb10_e < 0, NA))
+data$v2i_moisturework   <- factor(replace(df_original$v2arb10_f, df_original$v2arb10_f < 0, NA))
+data$v2i_uniformwork    <- factor(replace(df_original$v2arb10_g, df_original$v2arb10_g < 0, NA))
+```
+
+health status
+```{r}
+# self-rated health
+# 1 = very good , 2 = good, 3 = less good , 4 = bad 
+data$v2i_selfhealth <- as.factor(as.character(df_original$v2c033))
+# 1 = Better, 2 = Worse, 3 = No change, 4 = I don't know 
+data$v2i_selfhealthcompared <- as.factor(as.character(df_original$v2c033a))
+
+
+#comorbidities (1/0 yes/no)
+data$v2it_diabetes <- factor(ifelse(df_original$v2c040 == 1, "1",
+                                       ifelse(df_original$v2c040 == 2, "0", NA)))
+data$v2it_diabetesphysician <- factor(ifelse(df_original$v2c041 == 1, "1",
+                                       ifelse(df_original$v2c041 == 2, "0", NA)))
+
+data$v2it_hypertension <- factor(ifelse(df_original$v2c054 == 1, "1",
+                                       ifelse(df_original$v2c054 == 2, "0", NA)))
+data$v2it_hypertensionphysician <- factor(ifelse(df_original$v2c056 == 1, "1",
+                                       ifelse(df_original$v2c056 == 2, "0", NA)))
+
+#creating an asthma binary category, as there is missingness between cured and not cured
+data$v2it_everasthma <- factor(ifelse(df_original$v2da13aa == 1, "1",
+                                       ifelse(df_original$v2da13aa == 2, "0", NA)))
+data$v2it_asthmacured <- factor(ifelse(df_original$v2da13b == 1, "1",
+                                       ifelse(df_original$v2da13b == 2, "0", NA)))
+# 0/1/2 never asthma/current asthma/previous asthma, cured
+data$v2it_asthma <- with(data, case_when(
+  v2it_everasthma == 0 ~ "0",
+  v2it_everasthma == 1 & v2it_asthmacured == 1 ~ "2",  # cured
+  v2it_everasthma == 1 & v2it_asthmacured == 0 ~ "1",  # not cured
+  TRUE ~ NA_character_
+))
+
+data$v2it_asthma <- factor(data$v2it_asthma, levels = c("0", "1", "2"))
+
+data$v2it_sleepapnea <- factor(ifelse(df_original$v2c100b3 == 1, "1",
+                                       ifelse(df_original$v2c100b3 == 2, "0", NA)))
+data$v2it_hayfever <- factor(ifelse(df_original$v2da8aa == 1, "1",
+                                       ifelse(df_original$v2da8aa == 2, "0", NA)))
+data$v2it_coughsymptoms <- factor(ifelse(df_original$v2ba1 %in% c(1,2), "1",
+                                       ifelse(df_original$v2ba1 == 3, "0", NA)))
+data$v2it_sputumsymptoms <- factor(ifelse(df_original$v2ba2 %in% c(1,2), "1",
+                                       ifelse(df_original$v2ba2 == 3, "0", NA)))
+data$v2it_copd <- factor(ifelse(df_original$v2ba4a == 1, "1",
+                                       ifelse(df_original$v2ba4a == 2, "0", NA)))
+data$v2it_emphysema <- factor(ifelse(df_original$v2ba4b == 1, "1",
+                                       ifelse(df_original$v2ba4b == 2, "0", NA)))
+```
+
+anthropocentric measurements 
+correcting to include decimal places, cutoffs for obesity and whr
+```{r}
+#adding the before decimal place and after decimal place variables together
+data$v2it_height <- df_original$v2b_grosv + (df_original$v2b_grosn / 10)
+data$v2it_heightmeters <- data$v2it_height/100
+data$v2it_weight <- df_original$v2b_gewiv + (df_original$v2b_gewin / 10)
+data$v2i_bmi <- replace(df_original$v2tbmi, df_original$v2tbmi < 0 , NA) 
+
+#Waist and hip circumference is not auto-populated for all of the visits like the other variables. automatically enter it for the other columns
+data$v2it_waist <- replace(df_original$v2b_tumfv,df_original$v2b_tumfv < 0, NA) 
+data$v2it_waist <- data$v2it_waist + (df_original$v2b_tumfn / 10)
+data$v2it_hip <- replace(df_original$v2b_humfv, df_original$v2b_humfv < 0 , NA) 
+data$v2it_hip <- data$v2it_hip + (df_original$v2b_humfn / 10)
+
+data <- data %>%
+  group_by(ID) %>%
+  mutate(
+    v2it_waist = first(na.omit(v2it_waist)),
+    v2it_hip   = first(na.omit(v2it_hip))
+  ) %>%
+  ungroup()
+
+#creating new variable for whr -- provided value has only one decimal place
+data$v2it_whr <- round(data$v2it_waist / data$v2it_hip, 3)
+
+
+# 0/1/2/3 underweight/normal/overweight/obese
+data$v2it_bmiclass <- cut(
+  data$v2i_bmi,
+  breaks = c(-Inf, 18.5, 25, 30, Inf),
+  labels = c("0", "1", "2", "3"),
+  right = FALSE
+)
+data$v2it_bmiclass <- as.factor(as.character(data$v2it_bmiclass))
+
+# 0/1 low risk/high risk for abdominal obesity
+data$v2it_whrclass <- with(
+  data,
+  ifelse(
+    v2it_sex == 1,
+    ifelse(v2it_whr < 1.0,  "0", "1"), # men
+    ifelse(v2it_whr < 0.85, "0", "1")  # women
+  )
+)
+data$v2it_whrclass <- as.factor(as.character(data$v2it_whrclass))
+```
+
+
+creating new columns based on medication classifications, make them factors 
+```{r}
+atc_codes <- c("ATC_R03","ATC_R06","ATC_S01G","ATC_R01A",
+               "ATC_A10","ATC_C02","ATC_C03","ATC_C07",
+               "ATC_C08","ATC_C09")
+
+for(code in atc_codes){
+  data[[code]] <- factor(
+    as.integer(rowSums(
+      df_original[ , startsWith(names(df_original), code)] == 1,
+      na.rm = TRUE) > 0),
+    levels = c(0,1),
+    labels = c("0","1")
+  )
+}
+```
+
+
+
+#3. lung function variables
+
+protocol variables
+```{r}
+#protocol variables
+# 1 = Worse than usual , 2 = As usual, 3 = Better than usual 
+data$v2h_breathingquality <- as.factor(as.character(df_original$v2h_03))
+# 1/0 yes/no
+data$v2ht_rhinitissymptoms <- factor(ifelse(df_original$v2h_04 == 1, "1",
+                                       ifelse(df_original$v2h_04 == 2, "0", NA)))
+# 1/0 yes/no
+data$v2ht_respinfection <- factor(ifelse(df_original$v2h_05 == 1, "1",
+                                       ifelse(df_original$v2h_05 == 2, "0", NA)))
+data$v2ht_respinfectioncured <- replace(df_original$v2h_06, df_original$v2h_06 < 0 , NA) 
+# 1 = Excellent, 2 = Very good, 3 = Good, 4 = Less good, 5 = Bad 
+data$v2ht_healthtoday <- replace(df_original$v2h_12b, df_original$v2h_12b < 0 , NA) 
+data$v2ht_healthtoday <- as.factor(as.character(data$v2ht_healthtoday))
+
+# 1 = normal, 2 = reduced
+data$v2ht_cooperation <- replace(df_original$v2h_13, df_original$v2h_13 < 0 , NA) 
+data$v2ht_cooperation <- as.factor(as.character(data$v2ht_cooperation))
+```
+
+lung function variables
+```{r}
+data$v2h_FVC <- df_original$v2h_14_1m
+data$v2h_FVCpct <- df_original$v2h_14_1p
+data$v2h_FEV1 <- df_original$v2h_14_2m
+data$v2h_FEV1pct <- df_original$v2h_14_2p
+data$v2h_FEV1FVC <- df_original$v2h_14_3m
+
+#transformation from L to mL for easier interpretation
+data$v2h_FEV1_mL <- data$v2h_FEV1 * 1000
+data$v2h_FVC_mL  <- data$v2h_FVC  * 1000
+```
+
+recalculate percent, calculate z-scores
+```{r}
+#recalculating % predicted for comparison
+data[, c("v2ht_FEV1pct", "v2ht_FVCpct")] <- pctpred_GLI(
+  age      = data$v2it_age,
+  height   = data$v2it_heightmeters,
+  gender   = data$v2it_sex,
+  ethnicity = 1,          # all Caucasian
+  FEV1     = data$v2h_FEV1,
+  FVC      = data$v2h_FVC
+)
+
+
+data$v2ht_FEV1pct <- as.numeric(as.character(data$v2ht_FEV1pct))
+data$v2ht_FVCpct  <- as.numeric(as.character(data$v2ht_FVCpct))
+
+#calculating z-scores
+data[, c("v2ht_FEV1z", "v2ht_FVCz")] <- zscore_GLI(
+  age       = data$v2it_age,
+  height    = data$v2it_heightmeters,
+  gender    = data$v2it_sex,
+  ethnicity = 1,          # all Caucasian
+  FEV1      = data$v2h_FEV1,
+  FVC       = data$v2h_FVC
+)
+
+data$v2ht_FEV1z <- as.numeric(as.character(data$v2ht_FEV1z))
+data$v2ht_FVCz  <- as.numeric(as.character(data$v2ht_FVCz))
+```
+
+
+convert FVC and FEV1 measures to mL for easier interpretation
+```{r}
+data <- data %>%
+  mutate(
+    v2h_FEV1_mL = v2h_FEV1 * 1000,
+    v2h_FVC_mL  = v2h_FVC  * 1000
+  )
+```
+
+
+
+#4. exclude participants
+remove participants that were excluded
+- note that we do not exlcude for visits that are missing spirometry data here, as participant 10 is missing spriometry data for baseline, yet we need the other baseline measures for descriptive calculations
+```{r}
+data$v2i_ausschluss <- df_original$v2tb_ausschluss
+
+data <- data %>%
+  filter(v2i_ausschluss == 0)
+```
+
+
+#5. save dataset
+save as csv for reference, but also save as rds to conserve factors
+```{r}
+write.csv(data)
+saveRDS(data)
+```
+
+
+
+
+
+#6. adding in environmental variables
+two versions: imputed environmental data and non-imputed environmental data
+- from non-imputed data also create complete case datasets
+
+load datasets 
+```{r}
+df <- readRDS("")
+
+envraw <- read.csv("")
+envimp <- readRDS("")
+```
+
+restrict to visits with valid lung function data
+- not done previously because one participant has invalid lung function data for the baseline visit, but we still need the variables for descriptive analyses
+```{r}
+df <- df %>% filter(!is.na(v2ht_starttime))
+```
+
+
+
+#6.1. imputed environmental data
+
+create temporary dataset
+- update the date column and datetime col (use UTC without time jumps to match the variables)
+```{r}
+envimp_data <- data.frame(
+  datetime = as.POSIXct(envimp$datetime, format = "%Y-%m-%d %H", tz = "UTC")
+)
+
+envimp_data$env_temp <- envimp$env_temp_ufp
+envimp_data$env_PM25 <- envimp$env_PM25_ufp
+envimp_data$env_PM10 <- envimp$env_PM10_ufp
+envimp_data$env_rel_humidity <- envimp$env_humidity_ufp
+envimp_data$env_precip <- envimp$env_precip_ufp
+envimp_data$env_bc_880 <- envimp$env_bc_880_ufp
+
+#calculate absolute humidity
+envimp_data$env_abs_humidity <-
+  (6.112 * exp((17.67 * envimp_data$env_temp) /
+               (envimp_data$env_temp + 243.5)) *
+     (envimp_data$env_rel_humidity / 100) * 
+     216.7) / 
+  (273.15 + envimp_data$env_temp)
+
+# Ensure data are ordered
+envimp_data <- envimp_data %>%
+  arrange(datetime)
+```
+
+
+average night temperature 10 pm - 6 am
+```{r}
+env_night_temp <- envimp_data %>%
+  mutate(
+    date = as.Date(datetime),                  
+    night_date = if_else(hour(datetime) >= 22, date + 1, date)
+  ) %>%
+  filter(hour(datetime) >= 22 | hour(datetime) < 6) %>%
+  group_by(night_date) %>%
+  summarise(
+    env_temp_night_mean = mean(env_temp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+envimp_data <- envimp_data %>%
+  mutate(date = as.Date(datetime)) %>%
+  left_join(env_night_temp, by = c("date" = "night_date"))
+```
+
+calculating daily averages (i.e., 24 hour lags for each participant)
+- temperature, PM2.5, PM10, humidity, precipitation, and BV 880
+- SD, maximum, minimum, and range for all
+- note that the first 23 rows will be empty
+```{r}
+vars <- c("env_temp","env_PM25","env_PM10","env_rel_humidity", "env_abs_humidity", "env_precip","env_bc_880")
+
+# Create 24-hour rolling averages
+envimp_data <- envimp_data %>%
+  mutate(
+    across(
+      all_of(vars),
+      list(
+        daily_mean = ~ rollapply(.x, 24, mean,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_sd   = ~ rollapply(.x, 24, sd,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_min  = ~ rollapply(.x, 24, min,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_max  = ~ rollapply(.x, 24, max,
+                                 align = "right", fill = NA, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+```
+
+temperature averages "yesterday" (24-48 hours ago)
+- again, using rolling averages so first 48 hours will not have data
+```{r}
+#average temperature
+envimp_data <- envimp_data %>%
+  mutate(
+    env_temp_yesterday =
+      lag(
+        rollapply(
+          env_temp, 24, mean,
+          align = "right", fill = NA, na.rm = TRUE
+        ),
+        24
+      )
+  )
+
+#SD
+envimp_data <- envimp_data %>%
+  mutate(
+    env_temp_sd_yesterday =
+      lag(
+        rollapply(
+          env_temp_daily_sd, 24, mean,
+          align = "right", fill = NA, na.rm = TRUE
+        ),
+        24
+      )
+  )
+```
+
+temperature averages and SD over the last week
+- rolling averages (i.e., last 48 hours, last 72 hours, etc. etc.)
+```{r}
+#average temperature
+envimp_data <- envimp_data %>%
+  mutate(
+    env_temp_last2d  = rollapply(env_temp,  48, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last3d  = rollapply(env_temp,  72, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last4d  = rollapply(env_temp,  96, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last5d = rollapply(env_temp, 120, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last6d = rollapply(env_temp, 144, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last7d = rollapply(env_temp, 168, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last14d = rollapply(env_temp, 336, mean,
+                                 align = "right", fill = NA, na.rm = TRUE)
+
+  )
+
+#SD
+envimp_data <- envimp_data %>%
+  mutate(
+    env_temp_sd_last2d  = rollapply(env_temp_daily_sd,  48, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last3d  = rollapply(env_temp_daily_sd,  72, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last4d  = rollapply(env_temp_daily_sd,  96, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last5d = rollapply(env_temp_daily_sd, 120, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last6d = rollapply(env_temp_daily_sd, 144, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last7d = rollapply(env_temp_daily_sd, 168, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last14d = rollapply(env_temp_daily_sd, 336, mean,
+                                 align = "right", fill = NA, na.rm = TRUE)
+
+  )
+```
+
+daily average compared to yesterday, past week
+```{r}
+#average temperature
+envimp_data <- envimp_data %>%
+  mutate(
+    # Daily minus weekly average
+    temp_diff_weekly =
+      env_temp_daily_mean - env_temp_last7d,
+
+    # Daily minus yesterday average
+    temp_diff_yesterday =
+      env_temp_daily_mean - env_temp_yesterday
+  )
+
+#SD
+envimp_data <- envimp_data %>%
+  mutate(
+    # Daily minus weekly average
+    temp_sd_diff_weekly =
+      env_temp_daily_sd - env_temp_sd_last7d,
+
+    # Daily minus yesterday average
+    temp_sd_diff_yesterday =
+      env_temp_daily_sd - env_temp_sd_yesterday
+  )
+```
+
+hourly temperature lags (not really needed bc of distributed lag model)
+```{r}
+envimp_data <- envimp_data %>%
+  mutate(
+    # last 3 hours
+    env_temp_last3h = slide_index_dbl(
+      .x = env_temp,
+      .i = datetime,
+      .f = ~ mean(.x, na.rm = TRUE),
+      .before = hours(3),
+      .complete = FALSE
+    ),
+    
+    # last 7 hours
+    env_temp_last7h = slide_index_dbl(
+      .x = env_temp,
+      .i = datetime,
+      .f = ~ mean(.x, na.rm = TRUE),
+      .before = hours(7),
+      .complete = FALSE
+    )
+  )
+```
+
+add the imputed environmental columns to the dataset
+```{r}
+#round KORA data to the nearest hour to match with provided environmental data
+df$v2ht_starthour <- lubridate::round_date(df$v2ht_starttime, "hour")
+
+#join
+merged_data_imp <- df %>%
+  left_join(envimp_data, by = c("v2ht_starthour" = "datetime"))
+```
+
+```{r}
+merged_data_imp$env_temp_night_mean
+```
+
+
+save dataset
+```{r}
+write.csv(clean_df_env_imp)
+saveRDS(merged_data_imp)
+```
+
+
+
+
+#6.2. non-imputed environmental data
+
+create a temporary environmental data object
+- update the date column and datetime col (use UTC without time jumps to match the variables)
+- add main UFP data variables (temperature, Pm2.5, Pm10, black carbon, humidity, precipitation)
+```{r}
+env_data <- data.frame("date" = as.Date(envraw$date_neu, format = "%d-%B-%Y"))
+env_data$hour <- envraw$Hour
+env_data$datetime <- as.POSIXct(paste(env_data$date, env_data$hour), 
+                                format = "%Y-%m-%d %H", tz = "UTC")
+
+env_data$env_temp <- envraw$Temp_A_LfU_UFP
+env_data$env_PM25 <- envraw$PM25_A_LfU_UFP
+env_data$env_PM10 <- envraw$PM10_A_LfU_UFP
+env_data$env_rel_humidity <- envraw$Feuchte_A_LfU_UFP
+env_data$env_precip <- envraw$NI_A_LfU_UFP
+env_data$env_bc_880 <- envraw$BC_880_A_LfU_UFP
+
+env_data$env_abs_humidity <-
+  (6.112 * exp((17.67 * env_data$env_temp) /
+               (envimp_data$env_temp + 243.5)) *
+     (envimp_data$env_rel_humidity / 100) * 
+     216.7) / 
+  (273.15 + envimp_data$env_temp)
+
+# Ensure data are ordered
+env_data <- env_data %>%
+  arrange(datetime)
+```
+
+
+
+calculating daily averages (i.e., 24 hour lags for each participant)
+- temperature, PM2.5, PM10, humidity, precipitation, and BV 880
+- SD, maximum, minimum, and range for all
+```{r}
+vars <- c("env_temp","env_PM25","env_PM10","env_abs_humidity", "env_rel_humidity","env_precip","env_bc_880")
+
+# Create 24-hour rolling averages
+env_data <- env_data %>%
+  mutate(
+    across(
+      all_of(vars),
+      list(
+        daily_mean = ~ rollapply(.x, 24, mean,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_sd   = ~ rollapply(.x, 24, sd,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_min  = ~ rollapply(.x, 24, min,
+                                 align = "right", fill = NA, na.rm = TRUE),
+        daily_max  = ~ rollapply(.x, 24, max,
+                                 align = "right", fill = NA, na.rm = TRUE)
+      ),
+      .names = "{.col}_{.fn}"
+    )
+  )
+```
+
+average night temperature 10 pm - 6 am
+```{r}
+env_night_temp <- env_data %>%
+  mutate(
+    date = as.Date(datetime),                  
+    night_date = if_else(hour(datetime) >= 22, date + 1, date)
+  ) %>%
+  filter(hour(datetime) >= 22 | hour(datetime) < 6) %>%
+  group_by(night_date) %>%
+  summarise(
+    env_temp_night_mean = mean(env_temp, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+env_data <- env_data %>%
+  mutate(date = as.Date(datetime)) %>%
+  left_join(env_night_temp, by = c("date" = "night_date"))
+```
+
+
+temperature averages yesterday (24-28 hours ago)
+```{r}
+#average temperature
+env_data <- env_data %>%
+  mutate(
+    env_temp_yesterday =
+      lag(
+        rollapply(
+          env_temp, 24, mean,
+          align = "right", fill = NA, na.rm = TRUE
+        ),
+        24
+      )
+  )
+
+#SD
+env_data <- env_data %>%
+  mutate(
+    env_temp_sd_yesterday =
+      lag(
+        rollapply(
+          env_temp_daily_sd, 24, mean,
+          align = "right", fill = NA, na.rm = TRUE
+        ),
+        24
+      )
+  )
+```
+
+temperature averages and SD over the last week
+```{r}
+#average temperature
+env_data <- env_data %>%
+  mutate(
+    env_temp_last2d  = rollapply(env_temp,  48, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last3d  = rollapply(env_temp,  72, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last4d  = rollapply(env_temp,  96, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last5d = rollapply(env_temp, 120, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last6d = rollapply(env_temp, 144, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last7d = rollapply(env_temp, 168, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_last14d = rollapply(env_temp, 336, mean,
+                                 align = "right", fill = NA, na.rm = TRUE)
+
+  )
+
+#SD
+env_data <- env_data %>%
+  mutate(
+    env_temp_sd_last2d  = rollapply(env_temp_daily_sd,  48, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last3d  = rollapply(env_temp_daily_sd,  72, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last4d  = rollapply(env_temp_daily_sd,  96, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last5d = rollapply(env_temp_daily_sd, 120, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last6d = rollapply(env_temp_daily_sd, 144, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last7d = rollapply(env_temp_daily_sd, 168, mean,
+                                  align = "right", fill = NA, na.rm = TRUE),
+    env_temp_sd_last14d = rollapply(env_temp_daily_sd, 336, mean,
+                                 align = "right", fill = NA, na.rm = TRUE)
+
+  )
+```
+
+daily average compared to yesterday, past week
+```{r}
+#average temperature
+env_data <- env_data %>%
+  mutate(
+    # Daily minus weekly average
+    temp_diff_weekly =
+      env_temp_daily_mean - env_temp_last7d,
+
+    # Daily minus yesterday average
+    temp_diff_yesterday =
+      env_temp_daily_mean - env_temp_yesterday
+  )
+
+#SD
+env_data <- env_data %>%
+  mutate(
+    # Daily minus weekly average
+    temp_sd_diff_weekly =
+      env_temp_daily_sd - env_temp_sd_last7d,
+
+    # Daily minus yesterday average
+    temp_sd_diff_yesterday =
+      env_temp_daily_sd - env_temp_sd_yesterday
+  )
+```
+
+
+hourly temperature lags (not really needed bc of distributed lag model)
+```{r}
+env_data <- env_data %>%
+  mutate(
+    # last 3 hours
+    env_temp_last3h = slide_index_dbl(
+      .x = env_temp,
+      .i = datetime,
+      .f = ~ mean(.x, na.rm = TRUE),
+      .before = hours(3),
+      .complete = FALSE
+    ),
+    
+    # last 7 hours
+    env_temp_last7h = slide_index_dbl(
+      .x = env_temp,
+      .i = datetime,
+      .f = ~ mean(.x, na.rm = TRUE),
+      .before = hours(7),
+      .complete = FALSE
+    )
+  )
+```
+
+add the environmental columns to the dataset
+```{r}
+#round KORA data to the nearest hour to match with provided environmental data
+df$v2ht_starthour <- lubridate::round_date(df$v2ht_starttime, "hour")
+
+# drop other time columns to avoid duplicates
+env_data <- env_data %>%
+  select(-date, -hour)
+
+#join
+merged_data <- df %>%
+  left_join(env_data, by = c("v2ht_starthour" = "datetime"))
+```
+
+#save dataset
+```{r}
+write.csv(merged_data)
+saveRDS(merged_data)
+
+#also save just the non-imputed environmental variables to create CC datasets
+saveRDS(env_data)
+```
+
+
+
+
+
+#7. create create complete case datasets for environmental data 
+- these datasets have all relevant environmental data for the last 72 hours (originally using 72 prior hours for the crosis-basis)
+- start with the environmental df of non-imputed environmental variables
+
+For each environmental variable, create a binary column that notes if there is valid environmental data for each environmental variable for the previous <max_lag> hours. Currently set at 72.
+```{r}
+max_lag <- 72
+env_vars <- c("env_temp", "env_PM25", "env_PM10", "env_abs_humidity", "env_rel_humidity", "env_precip", "env_bc_880")
+
+for (v in env_vars) {
+  env_data[[paste0("keep_", v)]] <-
+    rollapply(
+      env_data[[v]],
+      width = max_lag,
+      align = "right",
+      fill = NA,
+      FUN = function(x) all(!is.na(x))
+    )
+}
+```
+
+add the new rows to the df dataset
+```{r}
+merged_data <- clean_df_w_env %>%
+  left_join(
+    env_data %>%
+      select(datetime, starts_with("keep_")),
+    by = c("v2ht_starthour" = "datetime")
+  )
+```
+
+print a summary of how many visits will be removed
+```{r}
+merged_data %>%
+  select(starts_with("keep_")) %>%
+  summarise(across(
+    everything(),
+    list(
+      TRUE_n  = ~ sum(. == TRUE, na.rm = TRUE),
+      FALSE_n = ~ sum(. == FALSE, na.rm = TRUE),
+      NA_n    = ~ sum(is.na(.)),
+      TRUE_pct  = ~ mean(. == TRUE, na.rm = TRUE) * 100,
+      FALSE_pct = ~ mean(. == FALSE, na.rm = TRUE) * 100
+    )
+  )) %>%
+  pivot_longer(
+    everything(),
+    names_to = c("variable", "metric"),
+    names_sep = "_(?=[^_]+$)"  # split at last underscore
+  ) %>%
+  pivot_wider(names_from = metric, values_from = value)
+```
+
+check if PM2.5 and PM10 have the same missingness patterns - they are equivalent
+```{r}
+sum(merged_data$keep_env_PM25 != merged_data$keep_env_PM10, na.rm = TRUE)
+```
+
+save dataset with the row indicating missing data
+```{r}
+saveRDS(merged_data)
+```
+
+create datasets for each environmental variable that removes rows without valid data
+```{r}
+# Per-variable filtered data frames
+df_temp     <- merged_data %>% filter(keep_env_temp)
+df_pm       <- merged_data %>% filter(keep_env_PM25)
+df_rel_humidity <- merged_data %>% filter(keep_env_rel_humidity)
+df_abs_humidity <- merged_data %>% filter(keep_env_abs_humidity)
+df_precip   <- merged_data %>% filter(keep_env_precip)
+df_bc       <- merged_data %>% filter(keep_env_bc_880)
+
+# A strict dataset requiring PM, temp, and humidity variables to be complete
+df_all <- merged_data %>% filter(
+  keep_env_temp &
+  keep_env_PM25 &
+  keep_env_rel_humidity
+)
+```
+
+save
+```{r}
+outdir <- ""
+
+saveRDS(df_temp,     file.path(outdir, "df_temp.rds"))
+saveRDS(df_pm,       file.path(outdir, "df_pm.rds"))
+saveRDS(df_rel_humidity, file.path(outdir, "df_rel_humidity.rds"))
+saveRDS(df_abs_humidity, file.path(outdir, "df_abs_humidity.rds"))
+saveRDS(df_precip,   file.path(outdir, "df_precip.rds"))
+saveRDS(df_bc,       file.path(outdir, "df_bc.rds"))
+saveRDS(df_all,      file.path(outdir, "df_cc_env.rds"))
+```
